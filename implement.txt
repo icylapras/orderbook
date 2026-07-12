@@ -1,0 +1,5 @@
+add:
+multithreading
+replaying real historical tick data
+benchmarked throughput/latency numbers
+unit tests
