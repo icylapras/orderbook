@@ -3,5 +3,6 @@
 enum class OrderType
 {
     GoodTillCancel,
-    FillAndKill
+    FillAndKill,
+    Market
 };
