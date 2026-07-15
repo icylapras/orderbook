@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <format>
 
+#include "Constants.h"
 #include "OrderType.h"
 #include "Usings.h"
 #include "Side.h"
@@ -22,6 +23,10 @@ public:
         , remainingQuantity_{ quantity }
     { }
 
+    Order(OrderId orderId, Side side, Quantity quantity)
+        : Order(OrderType::Market, orderId, side, Constants::InvalidPrice, quantity)
+    { }
+
     OrderId GetOrderId() const { return orderId_; }
     Side GetSide() const { return side_; }
     Price GetPrice() const { return price_; }
@@ -37,6 +42,16 @@ public:
 
         remainingQuantity_ -= quantity;
     }
+
+    void ToGoodTillCancel(Price price)
+    {
+        if (GetOrderType() != OrderType::Market)
+            throw std::logic_error(std::format("Order ({}) cannot have its price adjusted as only market orders can.", GetOrderId()));
+        
+        price_ = price;
+        orderType_ = OrderType::GoodTillCancel;
+        
+    }   
 
 private:
     OrderType orderType_;

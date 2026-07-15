@@ -4,5 +4,7 @@ enum class OrderType
 {
     GoodTillCancel,
     FillAndKill,
-    Market
+    FillOrKill,
+    Market,
+    GoodForDay
 };
