@@ -1,3 +1,4 @@
 *.exe
 *.o
 build_log.txt
+.clangd
