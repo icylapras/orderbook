@@ -77,14 +77,6 @@ Caveat: Windows' `steady_clock` ticks at ~100 ns, so single-sample p50s at that 
 
 The benchmark caught a real bug: `MatchOrders()` originally called `trades.reserve(orders_.size())` — a ~3 MB allocation on *every* add against a 100k-order book, even when nothing matched. Removing it cut resting-add latency from 15.8 µs to 198 ns (~80×).
 
-## Bugs found in the reference implementation
-
-This project started from the design in [Tzadiko/Orderbook](https://github.com/Tzadiko/Orderbook) (built as a learning exercise). Reading it critically turned up three latent bugs, all fixed here and covered by regression tests:
-
-1. **Deadlock** — `MatchOrders()` runs while `AddOrder` holds the mutex, and called the public `CancelOrder`, which locks the same non-recursive mutex again. Triggered the first time a `FillAndKill` order rests. Fixed by splitting cancel into a locking public wrapper and a lock-free internal (`CancelOrderInternal`).
-2. **Dangling reference / UB** — the match loop held `auto&` references to the front of the order list, then `pop_front()`-ed and kept using them. Fixed by copying the `shared_ptr` (which is what shared ownership is for).
-3. **Level-aggregate corruption** — `MatchOrders()` erased the per-level aggregate by price when one side's level emptied. `data_` is keyed by price alone and shared by both sides, so when a converted market order briefly rested at a price shared with the opposite side, the erase wiped the *other* side's aggregate too, making `FillOrKill` orders get wrongly rejected. Fixed by letting the count-based cleanup in `UpdateLevelData` handle removal. Regression: `tests/TestFiles/Match_FillOrKill_AfterMarket.txt`.
-
 ## Known limitations
 
 - A market order that only partially fills leaves its remainder resting as `GoodTillCancel` at the sweep-boundary price; real venues typically cancel the remainder.
