@@ -2,4 +2,4 @@
 *.o
 build_log.txt
 .clangd
-.implement.txt
+implement.txt
