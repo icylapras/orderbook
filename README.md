@@ -75,8 +75,6 @@ Per-operation latency on a book pre-seeded with **100,000 resting orders across 
 
 Caveat: Windows' `steady_clock` ticks at ~100 ns, so single-sample p50s at that scale sit at the measurement floor; means and p99s are the trustworthy columns.
 
-The benchmark caught a real bug: `MatchOrders()` originally called `trades.reserve(orders_.size())` — a ~3 MB allocation on *every* add against a 100k-order book, even when nothing matched. Removing it cut resting-add latency from 15.8 µs to 198 ns (~80×).
-
 ## Known limitations
 
 - A market order that only partially fills leaves its remainder resting as `GoodTillCancel` at the sweep-boundary price; real venues typically cancel the remainder.
