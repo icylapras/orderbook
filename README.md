@@ -82,8 +82,3 @@ The benchmark caught a real bug: `MatchOrders()` originally called `trades.reser
 - A market order that only partially fills leaves its remainder resting as `GoodTillCancel` at the sweep-boundary price; real venues typically cancel the remainder.
 - The single mutex serializes all operations — fine at these throughputs, but a real engine would use a single-threaded core with lock-free queues at the edges.
 - `GoodForDay` expiry uses the local clock's 16:00 with no exchange-calendar awareness.
-
-## Acknowledgements
-
-- Design based on [Tzadiko/Orderbook](https://github.com/Tzadiko/Orderbook)
-- Benchmark methodology inspired by [engineswap/orderbook](https://github.com/engineswap/orderbook)
