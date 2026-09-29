@@ -13,7 +13,7 @@ jobs:
       matrix:
         compiler: [g++, clang++]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build libgtest-dev
       - name: Configure (Release, -O3 -march=native)
@@ -36,7 +36,7 @@ jobs:
     name: AddressSanitizer + UndefinedBehaviorSanitizer
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       # the runner kernel's high-entropy ASLR breaks sanitizer shadow memory
@@ -58,7 +58,7 @@ jobs:
     name: ThreadSanitizer
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Reduce ASLR entropy for sanitizers
@@ -77,7 +77,7 @@ jobs:
     name: libFuzzer (ITCH parser -> both engines)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Reduce ASLR entropy for sanitizers
@@ -101,7 +101,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64

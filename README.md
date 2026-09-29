@@ -1,5 +1,7 @@
 # Orderbook
 
+[![CI](https://github.com/icylapras/orderbook/actions/workflows/ci.yml/badge.svg)](https://github.com/icylapras/orderbook/actions/workflows/ci.yml)
+
 A C++20 limit order book and matching engine, driven by a full day of real NASDAQ TotalView-ITCH 5.0 data. It has two engines that share one set of semantics: the original `std::map`/`shared_ptr` design and a rewrite built for latency. Every speed-up claimed here was measured, and every result was checked against NASDAQ's own executions.
 
 **Headline (AAPL, full day 2019-12-30, 1.51M book messages, median of 5 runs):**
