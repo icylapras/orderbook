@@ -178,9 +178,3 @@ perf stat -e cycles,instructions,cache-misses,L1-dcache-load-misses ./build/repl
 - A market order that only partially fills rests its remainder as `GoodTillCancel` at the sweep-boundary price. Real venues usually cancel the remainder.
 - The baseline's single mutex serialises everything. `FastOrderbook` is single-threaded by design and is fed through the SPSC queue.
 - `GoodForDay` expiry uses the local clock's 16:00 (baseline) or an explicit call (fast), with no exchange-calendar awareness.
-
-## Acknowledgements
-
-- Engine design based on [Tzadiko/Orderbook](https://github.com/Tzadiko/Orderbook)
-- Benchmark methodology inspired by [engineswap/orderbook](https://github.com/engineswap/orderbook)
-- Market data: [NASDAQ TotalView-ITCH 5.0 sample files](https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/)
