@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libgtest-dev
+      - name: Configure (Release, -O3 -march=native)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+      - name: Build
+        run: cmake --build build
+      - name: Unit, property and concurrency tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Replay a synthetic ITCH day with full validation
+        run: |
+          ./build/itchgen synthetic.itch --symbols 8 --messages 3000000
+          ./build/replay synthetic.itch --symbol SYN3 --warmup 1 --runs 1
+          ./build/replay synthetic.itch --all
+      - name: Benchmarks (smoke run; CI machines are too noisy for real numbers)
+        run: |
+          ./build/bench_engine
+          ./build/bench_queue --producer-cpu 0 --consumer-cpu 1
+
+  asan-ubsan:
+    name: AddressSanitizer + UndefinedBehaviorSanitizer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # the runner kernel's high-entropy ASLR breaks sanitizer shadow memory
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure (Debug, asserts on)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DORDERBOOK_SANITIZE=address,undefined
+      - name: Build
+        run: cmake --build build
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Replay under sanitizers
+        run: |
+          ./build/itchgen synthetic.itch --symbols 4 --messages 300000
+          ./build/replay synthetic.itch --symbol SYN1 --warmup 0 --runs 1
+          ./build/replay synthetic.itch --all
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DORDERBOOK_SANITIZE=thread
+      - name: Build
+        run: cmake --build build
+      # the expiry thread, concurrent callers and both queues across real threads
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure
+      - name: SPSC vs mutex queue across threads
+        run: ./build/bench_queue --producer-cpu 0 --consumer-cpu 1
+
+  fuzz:
+    name: libFuzzer (ITCH parser -> both engines)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Reduce ASLR entropy for sanitizers
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Build fuzzer
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ \
+                -DORDERBOOK_FUZZ=ON -DORDERBOOK_SANITIZE=address,undefined
+          cmake --build build --target fuzz_itch itchgen
+      - name: Seed corpus from a small synthetic feed
+        run: |
+          mkdir -p corpus
+          ./build/itchgen corpus/seed.itch --symbols 2 --messages 2000
+      - name: Fuzz for 60 seconds
+        run: ./build/fuzz_itch corpus -max_total_time=60 -max_len=4096
+
+  windows:
+    name: build + test (Windows, MSYS2 g++)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gtest
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Tests
+        run: ctest --test-dir build --output-on-failure

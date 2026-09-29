@@ -10,7 +10,7 @@
 #include <tuple>
 #include <vector>
 
-#include "Orderbook.h"
+#include "EngineAdapters.h"
 
 namespace googletest = ::testing;
 
@@ -212,30 +212,18 @@ public:
 
 class OrderbookTestsFixture : public googletest::TestWithParam<const char*>
 {
-private:
-    const static inline std::filesystem::path Root{ std::filesystem::current_path() };
-    const static inline std::filesystem::path TestFolder{ "TestFiles" };
 public:
-    const static inline std::filesystem::path TestFolderPath{ Root / TestFolder };
+    //set by CMake so the suite runs from any working directory
+    const static inline std::filesystem::path TestFolderPath{ ORDERBOOK_TEST_FILES };
 };
 
-TEST_P(OrderbookTestsFixture, OrderbookTestSuite)
+//every scenario runs against both engines
+template <typename Engine>
+void RunScenario(const std::filesystem::path& file)
 {
     // Arrange
-    const auto file = OrderbookTestsFixture::TestFolderPath / GetParam();
-
     InputHandler handler;
     const auto [actions, result] = handler.GetInformations(file);
-
-    auto GetOrder = [](const Information& action)
-    {
-        return std::make_shared<Order>(
-            action.orderType_,
-            action.orderId_,
-            action.side_,
-            action.price_,
-            action.quantity_);
-    };
 
     auto GetOrderModify = [](const Information& action)
     {
@@ -249,36 +237,42 @@ TEST_P(OrderbookTestsFixture, OrderbookTestSuite)
     };
 
     // Act
-    Orderbook orderbook;
+    Engine orderbook;
     for (const auto& action : actions)
     {
         switch (action.type_)
         {
         case ActionType::Add:
-        {
-            const Trades& trades = orderbook.AddOrder(GetOrder(action));
-        }
-        break;
+            orderbook.Add(action.orderType_, action.orderId_, action.side_, action.price_, action.quantity_);
+            break;
         case ActionType::Modify:
-        {
-            const Trades& trades = orderbook.MatchOrder(GetOrderModify(action));
-        }
-        break;
+            orderbook.Modify(GetOrderModify(action));
+            break;
         case ActionType::Cancel:
-        {
-            orderbook.CancelOrder(action.orderId_);
-        }
-        break;
+            orderbook.Cancel(action.orderId_);
+            break;
         default:
             throw std::logic_error("Unsupported Action.");
         }
     }
 
     // Assert
-    const auto& orderbookInfos = orderbook.GetLevelInfos();
-    ASSERT_EQ(orderbook.Size(), result.allCount_);
-    ASSERT_EQ(orderbookInfos.GetBids().size(), result.bidCount_);
-    ASSERT_EQ(orderbookInfos.GetAsks().size(), result.askCount_);
+    const auto& orderbookInfos = orderbook.Levels();
+    ASSERT_EQ(orderbook.Size(), result.allCount_) << Engine::Name;
+    ASSERT_EQ(orderbookInfos.GetBids().size(), result.bidCount_) << Engine::Name;
+    ASSERT_EQ(orderbookInfos.GetAsks().size(), result.askCount_) << Engine::Name;
+}
+
+TEST_P(OrderbookTestsFixture, Baseline)
+{
+    RunScenario<BaselineEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
+}
+
+TEST_P(OrderbookTestsFixture, Fast)
+{
+    RunScenario<FastEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
+    RunScenario<FastSortedEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
+    RunScenario<FastMixedEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
 }
 
 INSTANTIATE_TEST_SUITE_P(Tests, OrderbookTestsFixture, googletest::ValuesIn({

@@ -2,17 +2,19 @@
     "tasks": [
         {
             "type": "cppbuild",
-            "label": "Build orderbook",
+            "label": "Build demo",
             "command": "C:\\msys64\\ucrt64\\bin\\g++.exe",
             "args": [
                 "-fdiagnostics-color=always",
                 "-std=c++20",
                 "-Wall",
                 "-g",
-                "orderbook.cpp",
-                "main.cpp",
+                "-Isrc",
+                "src\\Orderbook.cpp",
+                "src\\FastOrderbook.cpp",
+                "tools\\demo.cpp",
                 "-o",
-                "orderbook.exe"
+                "demo.exe"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -24,7 +26,7 @@
                 "kind": "build",
                 "isDefault": true
             },
-            "detail": "Compile orderbook.cpp + main.cpp into orderbook.exe"
+            "detail": "Compile the demo into demo.exe"
         },
         {
             "type": "cppbuild",
@@ -33,9 +35,16 @@
             "args": [
                 "-fdiagnostics-color=always",
                 "-std=c++20",
-                "-I.",
-                "orderbook.cpp",
+                "-O2",
+                "-Isrc",
+                "-DORDERBOOK_TEST_FILES=\"${workspaceFolder}/tests/TestFiles\"",
+                "src\\Orderbook.cpp",
+                "src\\FastOrderbook.cpp",
                 "tests\\test.cpp",
+                "tests\\property_test.cpp",
+                "tests\\itch_test.cpp",
+                "tests\\components_test.cpp",
+                "tests\\concurrency_test.cpp",
                 "-lgtest",
                 "-lgtest_main",
                 "-o",
@@ -47,21 +56,23 @@
             "problemMatcher": [
                 "$gcc"
             ],
-            "detail": "Compile the GoogleTest suite (run tests.exe from tests/)"
+            "detail": "Compile the GoogleTest suite into tests\\tests.exe"
         },
         {
             "type": "cppbuild",
-            "label": "Build benchmark",
+            "label": "Build replay + benchmarks",
             "command": "C:\\msys64\\ucrt64\\bin\\g++.exe",
             "args": [
                 "-fdiagnostics-color=always",
                 "-std=c++20",
-                "-O2",
-                "-I.",
-                "orderbook.cpp",
-                "bench\\benchmark.cpp",
+                "-O3",
+                "-march=native",
+                "-Isrc",
+                "src\\Orderbook.cpp",
+                "src\\FastOrderbook.cpp",
+                "tools\\replay.cpp",
                 "-o",
-                "bench\\benchmark.exe"
+                "replay.exe"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -69,7 +80,7 @@
             "problemMatcher": [
                 "$gcc"
             ],
-            "detail": "Compile the latency benchmark with -O2"
+            "detail": "Compile the ITCH replay tool with -O3 -march=native (the CMake build builds everything)"
         }
     ],
     "version": "2.0.0"

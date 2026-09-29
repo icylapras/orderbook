@@ -3,3 +3,10 @@
 build_log.txt
 .clangd
 implement.txt
+# personal notes (dev log + CV notes), not part of the project
+devlog/
+build/
+build-*/
+/orderbook
+*.itch
+corpus/
