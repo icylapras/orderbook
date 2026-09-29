@@ -21,7 +21,11 @@ void Orderbook::PruneGoodForDayOrders()
         const auto now = system_clock::now();
         const auto now_c = system_clock::to_time_t(now);
         std::tm now_parts;
+#ifdef _WIN32
         localtime_s(&now_parts, &now_c);
+#else
+        localtime_r(&now_c, &now_parts);
+#endif
 
         if (now_parts.tm_hour >= end.count())
             now_parts.tm_mday += 1;
@@ -36,8 +40,10 @@ void Orderbook::PruneGoodForDayOrders()
         {
             std::unique_lock ordersLock{ ordersMutex_ };
 
-            if (shutdown_.load(std::memory_order_acquire) ||
-                shutdownConditionVariable_.wait_for(ordersLock, till) == std::cv_status::no_timeout)
+            //predicate form: a spurious wakeup must not end the thread, and the
+            //flag is re-checked under the lock so a shutdown can't be missed
+            if (shutdownConditionVariable_.wait_for(ordersLock, till,
+                [this] { return shutdown_.load(std::memory_order_acquire); }))
                 return;
         }
 
@@ -99,22 +105,23 @@ void Orderbook::CancelOrderInternal(OrderId orderId)
 
 void Orderbook::OnOrderCancelled(OrderPointer order)
 {
-    UpdateLevelData(order->GetPrice(), order->GetRemainingQuantity(), LevelData::Action::Remove);
+    UpdateLevelData(order->GetSide(), order->GetPrice(), order->GetRemainingQuantity(), LevelData::Action::Remove);
 }
 
 void Orderbook::OnOrderAdded(OrderPointer order)
 {
-    UpdateLevelData(order->GetPrice(), order->GetInitialQuantity(), LevelData::Action::Add);
+    UpdateLevelData(order->GetSide(), order->GetPrice(), order->GetInitialQuantity(), LevelData::Action::Add);
 }
 
-void Orderbook::OnOrderMatched(Price price, Quantity quantity, bool isFullyFilled)
+void Orderbook::OnOrderMatched(Side side, Price price, Quantity quantity, bool isFullyFilled)
 {
-    UpdateLevelData(price, quantity, isFullyFilled ? LevelData::Action::Remove : LevelData::Action::Match);
+    UpdateLevelData(side, price, quantity, isFullyFilled ? LevelData::Action::Remove : LevelData::Action::Match);
 }
 
-void Orderbook::UpdateLevelData(Price price, Quantity quantity, LevelData::Action action)
+void Orderbook::UpdateLevelData(Side side, Price price, Quantity quantity, LevelData::Action action)
 {
-    auto& data = data_[price];
+    auto& levels = LevelDataFor(side);
+    auto& data = levels[price];
 
     if (action == LevelData::Action::Add)
         data.count_ += 1;
@@ -127,7 +134,7 @@ void Orderbook::UpdateLevelData(Price price, Quantity quantity, LevelData::Actio
         data.quantity_ += quantity;
 
     if (data.count_ == 0)
-        data_.erase(price);
+        levels.erase(price);
 }
 
 bool Orderbook::CanFullyFill(Side side, Price price, Quantity quantity) const
@@ -135,15 +142,9 @@ bool Orderbook::CanFullyFill(Side side, Price price, Quantity quantity) const
     if (!canMatch(side, price))
         return false;
 
-    //best price on the opposite side; levels beyond it belong to our own side
-    Price threshold = side == Side::Buy ? asks_.begin()->first : bids_.begin()->first;
-
-    for (const auto& [levelPrice, levelData] : data_)
+    const auto& opposite = side == Side::Buy ? askData_ : bidData_;
+    for (const auto& [levelPrice, levelData] : opposite)
     {
-        if ((side == Side::Buy && levelPrice < threshold) ||
-            (side == Side::Sell && levelPrice > threshold))
-            continue;
-
         if ((side == Side::Buy && levelPrice > price) ||
             (side == Side::Sell && levelPrice < price))
             continue;
@@ -222,8 +223,8 @@ Trades Orderbook::MatchOrders()
                 TradeInfo{ ask->GetOrderId(), ask->GetPrice(), quantity }
                 });
 
-            OnOrderMatched(bid->GetPrice(), quantity, bid->IsFilled());
-            OnOrderMatched(ask->GetPrice(), quantity, ask->IsFilled());
+            OnOrderMatched(Side::Buy, bid->GetPrice(), quantity, bid->IsFilled());
+            OnOrderMatched(Side::Sell, ask->GetPrice(), quantity, ask->IsFilled());
         }
 
         if (bids.empty())
@@ -233,38 +234,37 @@ Trades Orderbook::MatchOrders()
             asks_.erase(askPrice);
     }
 
-    if (!bids_.empty())
-    {
-        auto& [_, bids] = *bids_.begin();
-        auto& order = bids.front();
-        if (order->GetOrderType() == OrderType::FillAndKill)
-            CancelOrderInternal(order->GetOrderId());
-    }
-
-    if (!asks_.empty())
-    {
-        auto& [_, asks] = *asks_.begin();
-        auto& order = asks.front();
-        if (order->GetOrderType() == OrderType::FillAndKill)
-            CancelOrderInternal(order->GetOrderId());
-    }
-
     return trades;
 }
 
-Orderbook::Orderbook() : ordersPruneThread_{ [this] { PruneGoodForDayOrders(); } } { }
+Orderbook::Orderbook(bool startExpiryThread)
+{
+    if (startExpiryThread)
+        ordersPruneThread_ = std::thread{ [this] { PruneGoodForDayOrders(); } };
+}
 
 Orderbook::~Orderbook()
 {
-    shutdown_.store(true, std::memory_order_release);
+    {
+        //set under the mutex: otherwise the store + notify can land between the
+        //prune thread checking the flag and blocking, and the wakeup is lost
+        std::scoped_lock ordersLock{ ordersMutex_ };
+        shutdown_.store(true, std::memory_order_release);
+    }
     shutdownConditionVariable_.notify_one();
-    ordersPruneThread_.join();
+
+    if (ordersPruneThread_.joinable())
+        ordersPruneThread_.join();
 }
 
 Trades Orderbook::AddOrder(OrderPointer order)
 {
     std::scoped_lock ordersLock{ ordersMutex_ };
+    return AddOrderInternal(order);
+}
 
+Trades Orderbook::AddOrderInternal(OrderPointer order)
+{
     if (orders_.contains(order->GetOrderId()))
         return { };
 
@@ -290,6 +290,29 @@ Trades Orderbook::AddOrder(OrderPointer order)
     if (order->GetOrderType() == OrderType::FillOrKill && !CanFullyFill(order->GetSide(), order->GetPrice(), order->GetInitialQuantity()))
         return { };
 
+    RestOrder(order);
+    auto trades = MatchOrders();
+
+    //a FillAndKill never rests: cancel whatever is left of *this* order. (This
+    //used to cancel a FAK only if it was at the front of the best level; once
+    //the book can be crossed, an older resting order can be ahead of it, and
+    //the remainder stayed in the book. Found by the crossed-book fuzz test.)
+    if (order->GetOrderType() == OrderType::FillAndKill)
+        CancelOrderInternal(order->GetOrderId());
+
+    return trades;
+}
+
+bool Orderbook::InsertOrderInternal(OrderPointer order)
+{
+    if (orders_.contains(order->GetOrderId()))
+        return false;
+    RestOrder(order);
+    return true;
+}
+
+void Orderbook::RestOrder(OrderPointer order)
+{
     OrderPointers::iterator iterator;
     if (order->GetSide() == Side::Buy)
     {
@@ -307,8 +330,6 @@ Trades Orderbook::AddOrder(OrderPointer order)
     orders_.insert({ order->GetOrderId(), OrderEntry{ order, iterator } });
 
     OnOrderAdded(order);
-
-    return MatchOrders();
 }
 
 void Orderbook::CancelOrder(OrderId orderId)
@@ -334,6 +355,64 @@ Trades Orderbook::MatchOrder(OrderModify order)
 
     CancelOrder(order.GetOrderId());
     return AddOrder(order.ToOrderPointer(orderType));
+}
+
+void Orderbook::ReduceOrder(OrderId orderId, Quantity quantity)
+{
+    std::scoped_lock ordersLock{ ordersMutex_ };
+
+    auto it = orders_.find(orderId);
+    if (it == orders_.end())
+        return;
+
+    const auto& order = it->second.order_;
+    if (quantity >= order->GetRemainingQuantity())
+    {
+        CancelOrderInternal(orderId);
+        return;
+    }
+
+    order->Fill(quantity);
+    UpdateLevelData(order->GetSide(), order->GetPrice(), quantity, LevelData::Action::Match);
+}
+
+void Orderbook::InsertOrder(OrderPointer order)
+{
+    std::scoped_lock ordersLock{ ordersMutex_ };
+    InsertOrderInternal(order);
+}
+
+void Orderbook::ReplaceOrder(OrderId orderId, OrderId newOrderId, Price price, Quantity quantity)
+{
+    std::scoped_lock ordersLock{ ordersMutex_ };
+
+    auto it = orders_.find(orderId);
+    if (it == orders_.end())
+        return;
+
+    const auto side = it->second.order_->GetSide();
+    const auto type = it->second.order_->GetOrderType();
+    CancelOrderInternal(orderId);
+
+    InsertOrderInternal(std::make_shared<Order>(type, newOrderId, side, price, quantity));
+}
+
+TopOfBook Orderbook::GetTopOfBook() const
+{
+    std::scoped_lock ordersLock{ ordersMutex_ };
+
+    TopOfBook top;
+    if (!bids_.empty())
+    {
+        top.bidPrice_ = bids_.begin()->first;
+        top.bidQuantity_ = bidData_.at(top.bidPrice_).quantity_;
+    }
+    if (!asks_.empty())
+    {
+        top.askPrice_ = asks_.begin()->first;
+        top.askQuantity_ = askData_.at(top.askPrice_).quantity_;
+    }
+    return top;
 }
 
 std::size_t Orderbook::Size() const
