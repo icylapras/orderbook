@@ -1,8 +1,8 @@
-//synthetic per-operation microbenchmark: the same workload against both
-//engines on a book pre-seeded with 100,000 resting orders across 1,000
-//price levels. (The ITCH replay tool is the real-data benchmark; this one
-//isolates individual operation types, including matching, which a NASDAQ
-//replay never exercises because NASDAQ's own book never crosses.)
+//synthetic per-operation microbenchmark on a book pre-seeded with 100,000
+//resting orders across 1,000 price levels. (The ITCH replay tool is the
+//real-data benchmark; this one isolates individual operation types,
+//including matching, which a NASDAQ replay never exercises because the
+//venue has already done the matching.)
 //
 //  bench_engine [--pin CPU]
 
@@ -15,27 +15,15 @@
 #include <string>
 #include <vector>
 
-#include "FastOrderbook.h"
-#include "Order.h"
 #include "Orderbook.h"
 #include "perf/Latency.h"
 
 namespace
 {
 
-struct Baseline
+struct Engine
 {
-    Orderbook book_{ false };
-    void Add(OrderType t, OrderId id, Side s, Price p, Quantity q) { book_.AddOrder(std::make_shared<Order>(t, id, s, p, q)); }
-    void Market(OrderId id, Side s, Quantity q) { book_.AddOrder(std::make_shared<Order>(id, s, q)); }
-    void Cancel(OrderId id) { book_.CancelOrder(id); }
-    void Modify(const OrderModify& m) { book_.MatchOrder(m); }
-    std::size_t Size() const { return book_.Size(); }
-};
-
-struct Fast
-{
-    FastOrderbook book_{ 1 << 18 };
+    Orderbook book_{ 1 << 18 };
     void Add(OrderType t, OrderId id, Side s, Price p, Quantity q) { book_.AddOrder(t, id, s, p, q); }
     void Market(OrderId id, Side s, Quantity q) { book_.AddMarketOrder(id, s, q); }
     void Cancel(OrderId id) { book_.CancelOrder(id); }
@@ -58,7 +46,7 @@ std::vector<Row> Run(double ticksPerNs)
     constexpr Price BestAsk = 1000;
     constexpr int NumOps = 20'000;
 
-    std::mt19937 rng{ 42 };//fixed seed: both engines see the identical workload
+    std::mt19937 rng{ 42 };//fixed seed: runs are comparable
     std::uniform_int_distribution<Quantity> qtyDist{ 100, 1000 };
 
     auto engine = std::make_unique<Engine>();
@@ -140,11 +128,9 @@ int main(int argc, char** argv)
     const double ticksPerNs = perf::CalibrateTicksPerNs();
     std::printf("Book pre-seeded with 100,000 resting orders over 1,000 levels; 20,000 samples per operation\n");
 
-    //one untimed pass of each to warm caches, predictors and the allocator
-    Run<Baseline>(ticksPerNs);
-    Run<Fast>(ticksPerNs);
+    //one untimed pass to warm caches, predictors and the allocator
+    Run<Engine>(ticksPerNs);
 
-    Print("Orderbook (baseline: std::map + std::list + shared_ptr + mutex)", Run<Baseline>(ticksPerNs));
-    Print("FastOrderbook (tick-ladder levels + pool + intrusive list)", Run<Fast>(ticksPerNs));
+    Print("Orderbook", Run<Engine>(ticksPerNs));
     return 0;
 }

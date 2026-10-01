@@ -16,14 +16,11 @@
 //never rests, so it never appears as an add.
 
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "FastOrderbook.h"
 #include "Itch.h"
-#include "Order.h"
 #include "Orderbook.h"
 
 namespace itch
@@ -55,38 +52,13 @@ inline Price ToPrice(std::uint32_t price) { return static_cast<Price>(price); }
 //applies one event to a book. The book mirrors NASDAQ's, so orders are
 //rested without matching: NASDAQ already matched everything it was going to,
 //and while a symbol is halted/paused its book can legitimately be crossed
-inline void Apply(FastOrderbook& book, const Event& e)
-{
-    switch (e.type_)
-    {
-    case 'A':
-    case 'F':
-        book.InsertOrder(e.reference_, ToSide(e.side_), ToPrice(e.price_), e.shares_);
-        break;
-    case 'E':
-    case 'C':
-    case 'X':
-        book.ReduceOrder(e.reference_, e.shares_);
-        break;
-    case 'D':
-        book.CancelOrder(e.reference_);
-        break;
-    case 'U':
-        book.ReplaceOrder(e.reference_, e.newReference_, ToPrice(e.price_), e.shares_);
-        break;
-    default:
-        break;
-    }
-}
-
 inline void Apply(Orderbook& book, const Event& e)
 {
     switch (e.type_)
     {
     case 'A':
     case 'F':
-        book.InsertOrder(std::make_shared<Order>(
-            OrderType::GoodTillCancel, e.reference_, ToSide(e.side_), ToPrice(e.price_), e.shares_));
+        book.InsertOrder(e.reference_, ToSide(e.side_), ToPrice(e.price_), e.shares_);
         break;
     case 'E':
     case 'C':

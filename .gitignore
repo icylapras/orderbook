@@ -10,3 +10,4 @@ build-*/
 /orderbook
 *.itch
 corpus/
+compile_commands.json

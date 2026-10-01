@@ -84,7 +84,7 @@ private:
 };
 
 //the conventional alternative: a std::deque behind a mutex, same interface,
-//used as the baseline in the queue benchmark
+//used as the point of comparison in the queue benchmark
 template <typename T>
 class MutexQueue
 {

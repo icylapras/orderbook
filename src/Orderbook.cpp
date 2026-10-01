@@ -1,446 +1,380 @@
 #include "Orderbook.h"
 
 #include <algorithm>
-#include <chrono>
-#include <ctime>
-#include <iterator>
-#include <numeric>
-#include <optional>
 
+#include "Constants.h"
 #include "LevelInfo.h"
-#include "OrderType.h"
 #include "TradeInfo.h"
 
-void Orderbook::PruneGoodForDayOrders()
+Orderbook::Orderbook(std::size_t expectedOrders, Price tickSize, std::uint32_t bandTicks)
+    : bids_{ Side::Buy, tickSize, bandTicks }
+    , asks_{ Side::Sell, tickSize, bandTicks }
+    , ids_{ expectedOrders }
 {
-    using namespace std::chrono;
-    const auto end = hours(16);
+    nodes_.reserve(expectedOrders);
+    levels_.reserve(std::clamp<std::size_t>(expectedOrders / 4, 64, 1 << 16));
+    trades_.reserve(64);
+}
 
-    while (true)
+std::uint32_t Orderbook::AllocateNode()
+{
+    if (freeNode_ != Nil)
     {
-        const auto now = system_clock::now();
-        const auto now_c = system_clock::to_time_t(now);
-        std::tm now_parts;
-#ifdef _WIN32
-        localtime_s(&now_parts, &now_c);
-#else
-        localtime_r(&now_c, &now_parts);
-#endif
-
-        if (now_parts.tm_hour >= end.count())
-            now_parts.tm_mday += 1;
-
-        now_parts.tm_hour = end.count();
-        now_parts.tm_min = 0;
-        now_parts.tm_sec = 0;
-
-        auto next = system_clock::from_time_t(mktime(&now_parts));
-        auto till = next - now + milliseconds(100);
-
-        {
-            std::unique_lock ordersLock{ ordersMutex_ };
-
-            //predicate form: a spurious wakeup must not end the thread, and the
-            //flag is re-checked under the lock so a shutdown can't be missed
-            if (shutdownConditionVariable_.wait_for(ordersLock, till,
-                [this] { return shutdown_.load(std::memory_order_acquire); }))
-                return;
-        }
-
-        OrderIds orderIds;
-
-        {
-            std::scoped_lock ordersLock{ ordersMutex_ };
-
-            for (const auto& [_, entry] : orders_)
-            {
-                const auto& [order, location] = entry;
-
-                if (order->GetOrderType() != OrderType::GoodForDay)
-                    continue;
-
-                orderIds.push_back(order->GetOrderId());
-            }
-        }
-
-        CancelOrders(orderIds);
+        const auto index = freeNode_;
+        freeNode_ = nodes_[index].next_;
+        return index;
     }
+
+    nodes_.emplace_back();
+    return static_cast<std::uint32_t>(nodes_.size() - 1);
 }
 
-void Orderbook::CancelOrders(OrderIds orderIds)
+void Orderbook::FreeNode(std::uint32_t index)
 {
-    std::scoped_lock ordersLock{ ordersMutex_ };
-
-    for (const auto& orderId : orderIds)
-        CancelOrderInternal(orderId);
+    nodes_[index].next_ = freeNode_;
+    freeNode_ = index;
 }
 
-void Orderbook::CancelOrderInternal(OrderId orderId)
+std::uint32_t Orderbook::AllocateLevel(Price price)
 {
-    if (!orders_.contains(orderId))
-        return;
-
-    const auto [order, iterator] = orders_.at(orderId);
-    orders_.erase(orderId);
-
-    if (order->GetSide() == Side::Sell)
+    std::uint32_t slot;
+    if (freeLevel_ != Nil)
     {
-        auto price = order->GetPrice();
-        auto& orders = asks_.at(price);
-        orders.erase(iterator);
-        if (orders.empty())
-            asks_.erase(price);
+        slot = freeLevel_;
+        freeLevel_ = levels_[slot].head_;
     }
     else
     {
-        auto price = order->GetPrice();
-        auto& orders = bids_.at(price);
-        orders.erase(iterator);
-        if (orders.empty())
-            bids_.erase(price);
+        slot = static_cast<std::uint32_t>(levels_.size());
+        levels_.emplace_back();
     }
 
-    OnOrderCancelled(order);
+    levels_[slot] = Level{ price, 0, 0, Nil, Nil };
+    return slot;
 }
 
-void Orderbook::OnOrderCancelled(OrderPointer order)
+void Orderbook::RemoveLevel(Side side, std::uint32_t slot)
 {
-    UpdateLevelData(order->GetSide(), order->GetPrice(), order->GetRemainingQuantity(), LevelData::Action::Remove);
+    LadderFor(side).Erase(levels_[slot].price_);
+    levels_[slot].head_ = freeLevel_;
+    freeLevel_ = slot;
 }
 
-void Orderbook::OnOrderAdded(OrderPointer order)
+void Orderbook::PushBack(Level& level, std::uint32_t index)
 {
-    UpdateLevelData(order->GetSide(), order->GetPrice(), order->GetInitialQuantity(), LevelData::Action::Add);
-}
+    auto& node = nodes_[index];
+    node.prev_ = level.tail_;
+    node.next_ = Nil;
 
-void Orderbook::OnOrderMatched(Side side, Price price, Quantity quantity, bool isFullyFilled)
-{
-    UpdateLevelData(side, price, quantity, isFullyFilled ? LevelData::Action::Remove : LevelData::Action::Match);
-}
-
-void Orderbook::UpdateLevelData(Side side, Price price, Quantity quantity, LevelData::Action action)
-{
-    auto& levels = LevelDataFor(side);
-    auto& data = levels[price];
-
-    if (action == LevelData::Action::Add)
-        data.count_ += 1;
-    else if (action == LevelData::Action::Remove)
-        data.count_ -= 1;
-
-    if (action == LevelData::Action::Remove || action == LevelData::Action::Match)
-        data.quantity_ -= quantity;
+    if (level.tail_ != Nil)
+        nodes_[level.tail_].next_ = index;
     else
-        data.quantity_ += quantity;
+        level.head_ = index;
 
-    if (data.count_ == 0)
-        levels.erase(price);
+    level.tail_ = index;
+    level.quantity_ += node.remainingQuantity_;
+    ++level.count_;
+}
+
+void Orderbook::Unlink(Level& level, std::uint32_t index)
+{
+    const auto& node = nodes_[index];
+
+    if (node.prev_ != Nil)
+        nodes_[node.prev_].next_ = node.next_;
+    else
+        level.head_ = node.next_;
+
+    if (node.next_ != Nil)
+        nodes_[node.next_].prev_ = node.prev_;
+    else
+        level.tail_ = node.prev_;
+
+    level.quantity_ -= node.remainingQuantity_;
+    --level.count_;
+}
+
+void Orderbook::RemoveOrder(std::uint32_t index)
+{
+    const auto& node = nodes_[index];
+    auto& level = levels_[node.level_];
+
+    Unlink(level, index);
+    if (level.count_ == 0)
+        RemoveLevel(node.side_, node.level_);
+
+    ids_.Erase(node.orderId_);
+    FreeNode(index);
+}
+
+bool Orderbook::CanMatch(Side side, Price price) const
+{
+    const auto best = Opposite(side).Best();
+    if (!best)
+        return false;
+    return side == Side::Buy ? price >= best.price_ : price <= best.price_;
 }
 
 bool Orderbook::CanFullyFill(Side side, Price price, Quantity quantity) const
 {
-    if (!canMatch(side, price))
+    if (!CanMatch(side, price))
         return false;
 
-    const auto& opposite = side == Side::Buy ? askData_ : bidData_;
-    for (const auto& [levelPrice, levelData] : opposite)
-    {
-        if ((side == Side::Buy && levelPrice > price) ||
-            (side == Side::Sell && levelPrice < price))
-            continue;
-
-        if (quantity <= levelData.quantity_)
-            return true;
-
-        quantity -= levelData.quantity_;
-    }
-
-    return false;
-}
-
-bool Orderbook::canMatch(Side side, Price price) const
-{
-    if (side == Side::Buy)
-    {
-        if (asks_.empty())
+    std::uint64_t needed = quantity;
+    bool filled = false;
+    Opposite(side).ForEachFromBest([&](PriceLadder::Entry e) {
+        if (side == Side::Buy ? e.price_ > price : e.price_ < price)
             return false;
 
-        const auto& [bestAsk, _] = *asks_.begin();
-        return price >= bestAsk;
-    }
-    else
-    {
-        if (bids_.empty())
+        const auto available = levels_[e.slot_].quantity_;
+        if (needed <= available)
+        {
+            filled = true;
             return false;
+        }
+        needed -= available;
+        return true;
+    });
 
-        const auto& [bestBid, _] = *bids_.begin();
-        return price <= bestBid;
-    }
+    return filled;
 }
 
-Trades Orderbook::MatchOrders()
+void Orderbook::MatchOrders()
 {
-    //no reserve: sizing to orders_.size() would allocate for the whole book
-    //on every add, when most adds produce zero trades
-    Trades trades;
-
     while (true)
     {
-        if (bids_.empty() || asks_.empty())
+        const auto bestBid = bids_.Best();
+        const auto bestAsk = asks_.Best();
+        if (!bestBid || !bestAsk || bestBid.price_ < bestAsk.price_)
             break;
 
-        auto& [bidPrice, bids] = *bids_.begin();
-        auto& [askPrice, asks] = *asks_.begin();
+        //no allocation happens in this loop, so the references stay valid
+        auto& bidLevel = levels_[bestBid.slot_];
+        auto& askLevel = levels_[bestAsk.slot_];
 
-        if (bidPrice < askPrice)
-            break;
-
-        while (!bids.empty() && !asks.empty())
+        while (bidLevel.count_ != 0 && askLevel.count_ != 0)
         {
-            //copies, not references: pop_front below would leave a reference dangling
-            auto bid = bids.front();
-            auto ask = asks.front();
+            const auto bidIndex = bidLevel.head_;
+            const auto askIndex = askLevel.head_;
+            auto& bid = nodes_[bidIndex];
+            auto& ask = nodes_[askIndex];
 
-            Quantity quantity = std::min(bid->GetRemainingQuantity(), ask->GetRemainingQuantity());
+            const Quantity quantity = std::min(bid.remainingQuantity_, ask.remainingQuantity_);
 
-            bid->Fill(quantity);
-            ask->Fill(quantity);
+            bid.remainingQuantity_ -= quantity;
+            ask.remainingQuantity_ -= quantity;
+            bidLevel.quantity_ -= quantity;
+            askLevel.quantity_ -= quantity;
 
-            if (bid->IsFilled())
-            {
-                bids.pop_front();
-                orders_.erase(bid->GetOrderId());
-            }
-
-            if (ask->IsFilled())
-            {
-                asks.pop_front();
-                orders_.erase(ask->GetOrderId());
-            }
-
-            trades.push_back(Trade{
-                TradeInfo{ bid->GetOrderId(), bid->GetPrice(), quantity },
-                TradeInfo{ ask->GetOrderId(), ask->GetPrice(), quantity }
+            trades_.push_back(Trade{
+                TradeInfo{ bid.orderId_, bid.price_, quantity },
+                TradeInfo{ ask.orderId_, ask.price_, quantity }
                 });
 
-            OnOrderMatched(Side::Buy, bid->GetPrice(), quantity, bid->IsFilled());
-            OnOrderMatched(Side::Sell, ask->GetPrice(), quantity, ask->IsFilled());
+            //a filled order has 0 remaining, so unlinking leaves the level quantity alone
+            if (bid.remainingQuantity_ == 0)
+            {
+                Unlink(bidLevel, bidIndex);
+                ids_.Erase(bid.orderId_);
+                FreeNode(bidIndex);
+            }
+
+            if (ask.remainingQuantity_ == 0)
+            {
+                Unlink(askLevel, askIndex);
+                ids_.Erase(ask.orderId_);
+                FreeNode(askIndex);
+            }
         }
 
-        if (bids.empty())
-            bids_.erase(bidPrice);
+        if (bidLevel.count_ == 0)
+            RemoveLevel(Side::Buy, bestBid.slot_);
 
-        if (asks.empty())
-            asks_.erase(askPrice);
+        if (askLevel.count_ == 0)
+            RemoveLevel(Side::Sell, bestAsk.slot_);
     }
-
-    return trades;
 }
 
-Orderbook::Orderbook(bool startExpiryThread)
+const Trades& Orderbook::AddOrder(OrderType type, OrderId orderId, Side side, Price price, Quantity quantity)
 {
-    if (startExpiryThread)
-        ordersPruneThread_ = std::thread{ [this] { PruneGoodForDayOrders(); } };
-}
+    trades_.clear();
 
-Orderbook::~Orderbook()
-{
+    if (type == OrderType::Market)
     {
-        //set under the mutex: otherwise the store + notify can land between the
-        //prune thread checking the flag and blocking, and the wakeup is lost
-        std::scoped_lock ordersLock{ ordersMutex_ };
-        shutdown_.store(true, std::memory_order_release);
+        //a market order rests as GTC at the worst opposite price so
+        //the order can sweep the entire opposite side
+        const auto worst = Opposite(side).Worst();
+        if (!worst)
+            return trades_;
+
+        price = worst.price_;
+        type = OrderType::GoodTillCancel;
     }
-    shutdownConditionVariable_.notify_one();
 
-    if (ordersPruneThread_.joinable())
-        ordersPruneThread_.join();
-}
+    if (type == OrderType::FillAndKill && !CanMatch(side, price))
+        return trades_;
 
-Trades Orderbook::AddOrder(OrderPointer order)
-{
-    std::scoped_lock ordersLock{ ordersMutex_ };
-    return AddOrderInternal(order);
-}
+    if (type == OrderType::FillOrKill && !CanFullyFill(side, price, quantity))
+        return trades_;
 
-Trades Orderbook::AddOrderInternal(OrderPointer order)
-{
-    if (orders_.contains(order->GetOrderId()))
-        return { };
+    if (!RestOrder(type, orderId, side, price, quantity))
+        return trades_;
 
-    if (order->GetOrderType() == OrderType::Market)
+    MatchOrders();
+
+    //a FillAndKill never rests: whatever is left after matching is cancelled
+    if (type == OrderType::FillAndKill)
     {
-        if (order->GetSide() == Side::Buy && !asks_.empty())
-        {
-            const auto& [worstAsk, _] = *asks_.rbegin();
-            order->ToGoodTillCancel(worstAsk);
-        }
-        else if (order->GetSide() == Side::Sell && !bids_.empty())
-        {
-            const auto& [worstBid, _] = *bids_.rbegin();
-            order->ToGoodTillCancel(worstBid);
-        }
-        else
-            return { };
+        const auto remaining = ids_.Find(orderId);
+        if (remaining != OrderIdMap::Missing)
+            RemoveOrder(remaining);
     }
 
-    if (order->GetOrderType() == OrderType::FillAndKill && !canMatch(order->GetSide(), order->GetPrice()))
-        return { };
-
-    if (order->GetOrderType() == OrderType::FillOrKill && !CanFullyFill(order->GetSide(), order->GetPrice(), order->GetInitialQuantity()))
-        return { };
-
-    RestOrder(order);
-    auto trades = MatchOrders();
-
-    //a FillAndKill never rests: cancel whatever is left of *this* order. (This
-    //used to cancel a FAK only if it was at the front of the best level; once
-    //the book can be crossed, an older resting order can be ahead of it, and
-    //the remainder stayed in the book. Found by the crossed-book fuzz test.)
-    if (order->GetOrderType() == OrderType::FillAndKill)
-        CancelOrderInternal(order->GetOrderId());
-
-    return trades;
+    return trades_;
 }
 
-bool Orderbook::InsertOrderInternal(OrderPointer order)
+bool Orderbook::RestOrder(OrderType type, OrderId orderId, Side side, Price price, Quantity quantity)
 {
-    if (orders_.contains(order->GetOrderId()))
+    //the duplicate-id check is folded into the insert: one hash probe per add
+    const auto index = AllocateNode();
+    if (!ids_.Insert(orderId, index))
+    {
+        FreeNode(index);
         return false;
-    RestOrder(order);
+    }
+
+    //the band is centred on the first price the book sees
+    bids_.CentreBand(price);
+    asks_.CentreBand(price);
+
+    auto& ladder = LadderFor(side);
+    auto slot = ladder.Find(price);
+    if (slot == Nil)
+    {
+        slot = AllocateLevel(price);
+        ladder.Insert(price, slot);
+    }
+
+    nodes_[index] = OrderNode{ orderId, price, quantity, Nil, Nil, slot, side, type };
+    PushBack(levels_[slot], index);
     return true;
 }
 
-void Orderbook::RestOrder(OrderPointer order)
+void Orderbook::InsertOrder(OrderId orderId, Side side, Price price, Quantity quantity)
 {
-    OrderPointers::iterator iterator;
-    if (order->GetSide() == Side::Buy)
-    {
-        auto& orders = bids_[order->GetPrice()];
-        orders.push_back(order);
-        iterator = std::prev(orders.end());
-    }
-    else
-    {
-        auto& orders = asks_[order->GetPrice()];
-        orders.push_back(order);
-        iterator = std::prev(orders.end());
-    }
+    RestOrder(OrderType::GoodTillCancel, orderId, side, price, quantity);
+}
 
-    orders_.insert({ order->GetOrderId(), OrderEntry{ order, iterator } });
-
-    OnOrderAdded(order);
+const Trades& Orderbook::AddMarketOrder(OrderId orderId, Side side, Quantity quantity)
+{
+    return AddOrder(OrderType::Market, orderId, side, Constants::InvalidPrice, quantity);
 }
 
 void Orderbook::CancelOrder(OrderId orderId)
 {
-    std::scoped_lock ordersLock{ ordersMutex_ };
-
-    CancelOrderInternal(orderId);
+    const auto index = ids_.Find(orderId);
+    if (index != OrderIdMap::Missing)
+        RemoveOrder(index);
 }
 
-Trades Orderbook::MatchOrder(OrderModify order)
+const Trades& Orderbook::ModifyOrder(const OrderModify& modify)
 {
-    OrderType orderType;
-
+    const auto index = ids_.Find(modify.GetOrderId());
+    if (index == OrderIdMap::Missing)
     {
-        std::scoped_lock ordersLock{ ordersMutex_ };
-
-        if (!orders_.contains(order.GetOrderId()))
-            return { };
-
-        const auto& [existingOrder, _ ] = orders_.at(order.GetOrderId());
-        orderType = existingOrder->GetOrderType();
+        trades_.clear();
+        return trades_;
     }
 
-    CancelOrder(order.GetOrderId());
-    return AddOrder(order.ToOrderPointer(orderType));
+    const auto type = nodes_[index].orderType_;
+    RemoveOrder(index);
+    return AddOrder(type, modify.GetOrderId(), modify.GetSide(), modify.GetPrice(), modify.GetQuantity());
 }
 
 void Orderbook::ReduceOrder(OrderId orderId, Quantity quantity)
 {
-    std::scoped_lock ordersLock{ ordersMutex_ };
-
-    auto it = orders_.find(orderId);
-    if (it == orders_.end())
+    const auto index = ids_.Find(orderId);
+    if (index == OrderIdMap::Missing)
         return;
 
-    const auto& order = it->second.order_;
-    if (quantity >= order->GetRemainingQuantity())
+    auto& node = nodes_[index];
+    if (quantity >= node.remainingQuantity_)
     {
-        CancelOrderInternal(orderId);
+        RemoveOrder(index);
         return;
     }
 
-    order->Fill(quantity);
-    UpdateLevelData(order->GetSide(), order->GetPrice(), quantity, LevelData::Action::Match);
-}
-
-void Orderbook::InsertOrder(OrderPointer order)
-{
-    std::scoped_lock ordersLock{ ordersMutex_ };
-    InsertOrderInternal(order);
+    node.remainingQuantity_ -= quantity;
+    levels_[node.level_].quantity_ -= quantity;
 }
 
 void Orderbook::ReplaceOrder(OrderId orderId, OrderId newOrderId, Price price, Quantity quantity)
 {
-    std::scoped_lock ordersLock{ ordersMutex_ };
-
-    auto it = orders_.find(orderId);
-    if (it == orders_.end())
+    const auto index = ids_.Find(orderId);
+    if (index == OrderIdMap::Missing)
         return;
 
-    const auto side = it->second.order_->GetSide();
-    const auto type = it->second.order_->GetOrderType();
-    CancelOrderInternal(orderId);
-
-    InsertOrderInternal(std::make_shared<Order>(type, newOrderId, side, price, quantity));
+    const auto side = nodes_[index].side_;
+    const auto type = nodes_[index].orderType_;
+    RemoveOrder(index);
+    RestOrder(type, newOrderId, side, price, quantity);
 }
 
-TopOfBook Orderbook::GetTopOfBook() const
+void Orderbook::CancelGoodForDayOrders()
 {
-    std::scoped_lock ordersLock{ ordersMutex_ };
-
-    TopOfBook top;
-    if (!bids_.empty())
+    OrderIds expired;
+    for (const auto* ladder : { &bids_, &asks_ })
     {
-        top.bidPrice_ = bids_.begin()->first;
-        top.bidQuantity_ = bidData_.at(top.bidPrice_).quantity_;
+        ladder->ForEachFromBest([&](PriceLadder::Entry e) {
+            for (auto i = levels_[e.slot_].head_; i != Nil; i = nodes_[i].next_)
+                if (nodes_[i].orderType_ == OrderType::GoodForDay)
+                    expired.push_back(nodes_[i].orderId_);
+            return true;
+        });
     }
-    if (!asks_.empty())
-    {
-        top.askPrice_ = asks_.begin()->first;
-        top.askQuantity_ = askData_.at(top.askPrice_).quantity_;
-    }
-    return top;
-}
 
-std::size_t Orderbook::Size() const
-{
-    std::scoped_lock ordersLock{ ordersMutex_ };
-    return orders_.size();
+    for (const auto orderId : expired)
+        CancelOrder(orderId);
 }
 
 OrderbookLevelInfos Orderbook::GetLevelInfos() const
 {
-    std::scoped_lock ordersLock{ ordersMutex_ };
-
     LevelInfos bidInfos, askInfos;
-    bidInfos.reserve(orders_.size());
-    askInfos.reserve(orders_.size());
-
-    auto CreateLevelInfos = [](Price price, const OrderPointers& orders)
-    {
-        return LevelInfo{ price, std::accumulate(orders.begin(), orders.end(), (Quantity)0,
-            [](Quantity runningSum, const OrderPointer& order)
-        { return runningSum + order->GetRemainingQuantity(); }) };
+    auto collect = [this](LevelInfos& out) {
+        return [this, &out](PriceLadder::Entry e) {
+            out.push_back(LevelInfo{ e.price_, static_cast<Quantity>(levels_[e.slot_].quantity_) });
+            return true;
+        };
     };
+    bids_.ForEachFromBest(collect(bidInfos));
+    asks_.ForEachFromBest(collect(askInfos));
+    return OrderbookLevelInfos{ bidInfos, askInfos };
+}
 
-    for (const auto& [price, orders] : bids_)
-        bidInfos.push_back(CreateLevelInfos(price, orders));
-    for (const auto& [price, orders] : asks_)
-        askInfos.push_back(CreateLevelInfos(price, orders));
+TopOfBook Orderbook::GetTopOfBook() const
+{
+    TopOfBook top;
+    if (const auto bid = bids_.Best())
+    {
+        top.bidPrice_ = bid.price_;
+        top.bidQuantity_ = static_cast<Quantity>(levels_[bid.slot_].quantity_);
+    }
+    if (const auto ask = asks_.Best())
+    {
+        top.askPrice_ = ask.price_;
+        top.askQuantity_ = static_cast<Quantity>(levels_[ask.slot_].quantity_);
+    }
+    return top;
+}
 
-    return OrderbookLevelInfos{ bidInfos, askInfos};
-
+void Orderbook::Clear()
+{
+    bids_.Clear();
+    asks_.Clear();
+    levels_.clear();
+    freeLevel_ = Nil;
+    nodes_.clear();
+    freeNode_ = Nil;
+    ids_.Clear();
+    trades_.clear();
 }

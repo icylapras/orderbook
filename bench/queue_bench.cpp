@@ -4,7 +4,7 @@
 //  bench_queue [itch-file --symbol AAPL] [--producer-cpu N] [--consumer-cpu N]
 //
 //The producer plays the feed handler: it stamps each ITCH event with the TSC
-//and pushes it; the consumer owns a FastOrderbook, pops, applies, and records
+//and pushes it; the consumer owns a Orderbook, pops, applies, and records
 //stamp-to-applied latency. Two modes:
 //  - saturated: producer pushes as fast as it can  -> throughput
 //  - paced:     one message every ~1us             -> handoff latency without
@@ -23,7 +23,7 @@
 
 #include <immintrin.h>
 
-#include "FastOrderbook.h"
+#include "Orderbook.h"
 #include "SpscQueue.h"
 #include "itch/ItchFile.h"
 #include "itch/Replay.h"
@@ -82,7 +82,7 @@ Result Run(const std::vector<itch::Event>& events, int producerCpu, int consumer
     std::thread consumer{ [&] {
         if (consumerCpu >= 0)
             perf::PinCurrentThread(consumerCpu);
-        FastOrderbook book{ events.size() };
+        Orderbook book{ events.size() };
         ready.store(true, std::memory_order_release);
 
         Message m;

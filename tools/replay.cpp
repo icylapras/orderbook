@@ -1,21 +1,21 @@
-//replay a NASDAQ TotalView-ITCH 5.0 day through both engines.
+//replay a NASDAQ TotalView-ITCH 5.0 day through the order book.
 //
 //  replay <file|-> [--symbol AAPL] [--all] [--pin CPU] [--warmup N] [--runs N]
 //                  [--expect-open PRICE] [--expect-close PRICE]
-//                  [--engine fast|baseline|both] [--no-validate]
-//                  [--tick PRICE_UNITS] [--band TICKS]   (fast book layout; --band 0 = sorted vector only)
+//                  [--no-validate]
+//                  [--tick PRICE_UNITS] [--band TICKS]   (price-level layout; --band 0 = sorted vector only)
 //                  [--strict]   (--all: validate after every message instead of per chunk)
 //
 //single-symbol mode (default AAPL):
 //  1. parse the whole file, keeping that symbol's events in memory
-//  2. validate: replay through both engines in lockstep, checking the book
-//     against NASDAQ's own executions/prints and the two engines against
-//     each other after every message
+//  2. validate: check the book after every message against NASDAQ's own
+//     executions/prints and against an independent rebuild of the book
+//     (FeedMirror)
 //  3. latency: warm-up runs, then per-message rdtsc timing into a histogram
 //  4. throughput: untimed-per-message runs, messages/sec
 //
 //--all mode: every symbol in the file, streamed in chunks (the full day does
-//not fit in memory), both engines, one book per symbol
+//not fit in memory), one book per symbol
 
 #include <algorithm>
 #include <atomic>
@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
 #include <new>
 #include <set>
@@ -32,7 +34,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "FastOrderbook.h"
 #include "Orderbook.h"
 #include "itch/ItchFile.h"
 #include "itch/Replay.h"
@@ -86,7 +87,6 @@ struct Options
     int runs_{ 5 };
     double expectOpen_{ 0 };
     double expectClose_{ 0 };
-    std::string engine_{ "both" };//fast | baseline | both
     bool strict_{ false };        //--all: check every message (slower; timings not comparable)
     Price tick_{ 100 };           //ITCH prices are 1/10000 $: 100 = one cent
     std::uint32_t band_{ 4096 };  //ticks in the fast book's price ladder band
@@ -145,11 +145,178 @@ std::FILE* Open(const std::string& path)
 
 //---------------------------------------------------------------- validation
 
-struct ShadowOrder
+//an independent rebuild of the book straight from the feed: a hash map of
+//orders and a std::map of price levels per symbol, written as plainly as
+//possible and sharing no code with Orderbook, so agreement between the two
+//means something
+class FeedMirror
 {
-    std::uint32_t price_;
-    std::uint32_t shares_;
-    char side_;
+public:
+    struct Order
+    {
+        std::uint32_t price_;
+        std::uint32_t shares_;
+        std::uint16_t locate_;
+        char side_;
+    };
+
+    const Order* Find(std::uint64_t reference) const
+    {
+        const auto it = orders_.find(reference);
+        return it == orders_.end() ? nullptr : &it->second;
+    }
+
+    void Apply(const itch::Event& e)
+    {
+        switch (e.type_)
+        {
+        case 'A':
+        case 'F':
+            Add(e.reference_, Order{ e.price_, e.shares_, e.locate_, e.side_ });
+            break;
+        case 'E':
+        case 'C':
+        case 'X':
+            if (auto it = orders_.find(e.reference_); it != orders_.end())
+            {
+                const auto reduce = std::min(e.shares_, it->second.shares_);
+                Level(it->second) -= reduce;
+                it->second.shares_ -= reduce;
+                if (it->second.shares_ == 0)
+                    Remove(it);
+            }
+            break;
+        case 'D':
+            if (auto it = orders_.find(e.reference_); it != orders_.end())
+                Remove(it);
+            break;
+        case 'U':
+            if (auto it = orders_.find(e.reference_); it != orders_.end())
+            {
+                const auto old = it->second;
+                Remove(it);
+                Add(e.newReference_, Order{ e.price_, e.shares_, old.locate_, old.side_ });
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    TopOfBook Top(std::uint16_t locate) const
+    {
+        TopOfBook top;
+        const auto it = books_.find(locate);
+        if (it == books_.end())
+            return top;
+        if (!it->second.bids_.empty())
+        {
+            top.bidPrice_ = static_cast<Price>(it->second.bids_.begin()->first);
+            top.bidQuantity_ = static_cast<Quantity>(it->second.bids_.begin()->second);
+        }
+        if (!it->second.asks_.empty())
+        {
+            top.askPrice_ = static_cast<Price>(it->second.asks_.begin()->first);
+            top.askQuantity_ = static_cast<Quantity>(it->second.asks_.begin()->second);
+        }
+        return top;
+    }
+
+    //every level on both sides, best first, as the engine reports them
+    bool SameDepth(std::uint16_t locate, const OrderbookLevelInfos& depth) const
+    {
+        const auto it = books_.find(locate);
+        const std::size_t bids = it == books_.end() ? 0 : it->second.bids_.size();
+        const std::size_t asks = it == books_.end() ? 0 : it->second.asks_.size();
+        if (depth.GetBids().size() != bids || depth.GetAsks().size() != asks)
+            return false;
+        if (it == books_.end())
+            return true;
+
+        auto same = [](const auto& levels, const LevelInfos& infos)
+        {
+            std::size_t i = 0;
+            for (const auto& [price, quantity] : levels)
+            {
+                if (infos[i].price_ != static_cast<Price>(price) || infos[i].quantity_ != static_cast<Quantity>(quantity))
+                    return false;
+                ++i;
+            }
+            return true;
+        };
+        return same(it->second.bids_, depth.GetBids()) && same(it->second.asks_, depth.GetAsks());
+    }
+
+    std::size_t Size() const { return orders_.size(); }
+    std::size_t Size(std::uint16_t locate) const
+    {
+        const auto it = counts_.find(locate);
+        return it == counts_.end() ? 0 : it->second;
+    }
+
+private:
+    struct Book
+    {
+        std::map<std::uint32_t, std::uint64_t, std::greater<>> bids_;//best (highest) first
+        std::map<std::uint32_t, std::uint64_t> asks_;                //best (lowest) first
+    };
+
+    std::uint64_t& Level(const Order& o)
+    {
+        auto& book = books_[o.locate_];
+        return o.side_ == 'B' ? book.bids_[o.price_] : book.asks_[o.price_];
+    }
+
+    void Add(std::uint64_t reference, const Order& o)
+    {
+        if (!orders_.emplace(reference, o).second)
+            return;//duplicate reference: ignored, as the engine does
+        Level(o) += o.shares_;
+        ++levelOrders_[Key(o)];
+        ++counts_[o.locate_];
+    }
+
+    void Remove(std::unordered_map<std::uint64_t, Order>::iterator it)
+    {
+        const auto o = it->second;
+        auto& book = books_[o.locate_];
+        if (o.side_ == 'B')
+        {
+            auto level = book.bids_.find(o.price_);
+            level->second -= o.shares_;
+            if (level->second == 0 && !HasOtherOrders(o))
+                book.bids_.erase(level);
+        }
+        else
+        {
+            auto level = book.asks_.find(o.price_);
+            level->second -= o.shares_;
+            if (level->second == 0 && !HasOtherOrders(o))
+                book.asks_.erase(level);
+        }
+        --counts_[o.locate_];
+        orders_.erase(it);
+        levelOrders_[Key(o)] -= 1;
+        if (levelOrders_[Key(o)] == 0)
+            levelOrders_.erase(Key(o));
+    }
+
+    //a level stays while any order rests on it, even at zero shares
+    //(a zero-size add is legal on the wire, and the engine keeps it too)
+    static std::uint64_t Key(const Order& o)
+    {
+        return (static_cast<std::uint64_t>(o.locate_) << 40) ^ (static_cast<std::uint64_t>(o.side_ == 'B') << 39) ^ o.price_;
+    }
+    bool HasOtherOrders(const Order& o) const
+    {
+        const auto it = levelOrders_.find(Key(o));
+        return it != levelOrders_.end() && it->second > 1;
+    }
+
+    std::unordered_map<std::uint64_t, Order> orders_;
+    std::unordered_map<std::uint16_t, Book> books_;
+    std::unordered_map<std::uint16_t, std::size_t> counts_;
+    std::unordered_map<std::uint64_t, std::size_t> levelOrders_;//orders per (symbol, side, price)
 };
 
 struct ValidationResult
@@ -157,19 +324,14 @@ struct ValidationResult
     bool passed_{ true };
 };
 
-
-//replays both engines in lockstep and checks the reconstructed book against
-//what NASDAQ itself reported
+//replays the book and checks it after every message against the feed mirror
+//and against what NASDAQ itself reported
 ValidationResult Validate(const std::vector<itch::Event>& events, const Options& options)
 {
-    std::printf("\n== Validation (both engines in lockstep, checked after every message) ==\n");
+    std::printf("\n== Validation (checked after every message) ==\n");
 
-    FastOrderbook fast{ 1 << 16, options.tick_, options.band_ };
-    Orderbook baseline{ false };
-
-    //shadow copy of every live order, only to know an order's price/side
-    //when NASDAQ executes it (the engines don't need or expose this)
-    std::unordered_map<std::uint64_t, ShadowOrder> shadow;
+    Orderbook book{ 1 << 16, options.tick_, options.band_ };
+    FeedMirror mirror;
 
     std::uint64_t topMismatches = 0, crossedSamples = 0, crossedWhileTrading = 0, unknownReferences = 0;
     char tradingState = '?';
@@ -178,21 +340,15 @@ ValidationResult Validate(const std::vector<itch::Event>& events, const Options&
     std::uint64_t hiddenPrints = 0, hiddenPrintsInsideSpread = 0;
     std::uint64_t firstMismatchIndex = UINT64_MAX;
     std::uint64_t depthComparisons = 0, depthMismatches = 0;
-    std::size_t peakLive = 0;
+    std::size_t peakLive = 0, maxBidLevels = 0, maxAskLevels = 0;
+    std::uint16_t locate = 0;
 
-    auto sameLevels = [](const LevelInfos& a, const LevelInfos& b)
+    auto sameDepth = [&]()
     {
-        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
-            [](const LevelInfo& x, const LevelInfo& y) { return x.price_ == y.price_ && x.quantity_ == y.quantity_; });
-    };
-    std::size_t maxBidLevels = 0, maxAskLevels = 0;
-    auto sameDepth = [&](const Orderbook& a, const FastOrderbook& b)
-    {
-        const auto x = a.GetLevelInfos();
-        const auto y = b.GetLevelInfos();
-        maxBidLevels = std::max(maxBidLevels, y.GetBids().size());
-        maxAskLevels = std::max(maxAskLevels, y.GetAsks().size());
-        return sameLevels(x.GetBids(), y.GetBids()) && sameLevels(x.GetAsks(), y.GetAsks());
+        const auto depth = book.GetLevelInfos();
+        maxBidLevels = std::max(maxBidLevels, depth.GetBids().size());
+        maxAskLevels = std::max(maxAskLevels, depth.GetAsks().size());
+        return mirror.SameDepth(locate, depth);
     };
 
     std::uint32_t regularHigh = 0, regularLow = UINT32_MAX;
@@ -215,14 +371,15 @@ ValidationResult Validate(const std::vector<itch::Event>& events, const Options&
     for (std::size_t i = 0; i < events.size(); ++i)
     {
         const auto& e = events[i];
+        locate = e.locate_;
 
         while (nextSnapshot < std::size(snapshotTimes) && e.timestamp_ >= snapshotTimes[nextSnapshot])
         {
-            snapshots.push_back(TimeOfDay(snapshotTimes[nextSnapshot]) + "  " + FormatTop(fast.GetTopOfBook()));
+            snapshots.push_back(TimeOfDay(snapshotTimes[nextSnapshot]) + "  " + FormatTop(book.GetTopOfBook()));
             ++nextSnapshot;
         }
 
-        const TopOfBook top = fast.GetTopOfBook();
+        const TopOfBook top = book.GetTopOfBook();
 
         switch (e.type_)
         {
@@ -254,8 +411,8 @@ ValidationResult Validate(const std::vector<itch::Event>& events, const Options&
         case 'E':
         case 'C':
         {
-            const auto it = shadow.find(e.reference_);
-            if (it == shadow.end())
+            const auto* order = mirror.Find(e.reference_);
+            if (!order)
             {
                 ++unknownReferences;
                 break;
@@ -263,88 +420,55 @@ ValidationResult Validate(const std::vector<itch::Event>& events, const Options&
 
             //an incoming order always executes against the best price first,
             //so the order NASDAQ reports as executed must sit at our touch
-            const Price best = it->second.side_ == 'B' ? top.bidPrice_ : top.askPrice_;
+            const Price best = order->side_ == 'B' ? top.bidPrice_ : top.askPrice_;
             ++executions;
-            executionsAtTouch += static_cast<Price>(it->second.price_) == best;
+            executionsAtTouch += static_cast<Price>(order->price_) == best;
             //'C' at a price other than the order's own: a cross fill or price improvement
-            executionsAwayFromOrderPrice += e.type_ == 'C' && e.price_ != it->second.price_;
+            executionsAwayFromOrderPrice += e.type_ == 'C' && e.price_ != order->price_;
 
             if (e.type_ == 'E' || e.side_ == 'Y')//'C' prints only if printable
-                trackPrint(e.timestamp_, e.type_ == 'E' ? it->second.price_ : e.price_);
+                trackPrint(e.timestamp_, e.type_ == 'E' ? order->price_ : e.price_);
             break;
         }
         case 'X':
         case 'D':
         case 'U':
-            if (!shadow.contains(e.reference_))
+            if (!mirror.Find(e.reference_))
                 ++unknownReferences;
             break;
         default:
             break;
         }
 
-        //shadow bookkeeping
-        switch (e.type_)
-        {
-        case 'A':
-        case 'F':
-            shadow[e.reference_] = ShadowOrder{ e.price_, e.shares_, e.side_ };
-            break;
-        case 'E':
-        case 'C':
-        case 'X':
-            if (auto it = shadow.find(e.reference_); it != shadow.end())
-            {
-                if (e.shares_ >= it->second.shares_)
-                    shadow.erase(it);
-                else
-                    it->second.shares_ -= e.shares_;
-            }
-            break;
-        case 'D':
-            shadow.erase(e.reference_);
-            break;
-        case 'U':
-            if (auto it = shadow.find(e.reference_); it != shadow.end())
-            {
-                const char side = it->second.side_;
-                shadow.erase(it);
-                shadow[e.newReference_] = ShadowOrder{ e.price_, e.shares_, side };
-            }
-            break;
-        default:
-            break;
-        }
+        mirror.Apply(e);
+        itch::Apply(book, e);
 
-        itch::Apply(fast, e);
-        itch::Apply(baseline, e);
-
-        const auto fastTop = fast.GetTopOfBook();
-        if (fastTop != baseline.GetTopOfBook())
+        const auto bookTop = book.GetTopOfBook();
+        if (bookTop != mirror.Top(locate))
         {
             ++topMismatches;
             firstMismatchIndex = std::min<std::uint64_t>(firstMismatchIndex, i);
         }
-        if (fastTop.IsCrossed())
+        if (bookTop.IsCrossed())
         {
             ++crossedSamples;
             crossedWhileTrading += !CrossingAllowed(tradingState, tradingStateSince, e.timestamp_);
         }
-        peakLive = std::max(peakLive, shadow.size());
+        peakLive = std::max(peakLive, mirror.Size());
 
         //full depth (every level, both sides), not just the top, every 10k messages
         if (i % 10'000 == 0)
         {
             ++depthComparisons;
-            depthMismatches += !sameDepth(baseline, fast);
+            depthMismatches += !sameDepth();
         }
     }
     ++depthComparisons;
-    depthMismatches += !sameDepth(baseline, fast);
+    depthMismatches += !sameDepth();
 
-    std::printf("Top of book through the day (FastOrderbook):\n     time          bid size @ bid        | ask        @ ask size\n");
-    for (const auto& s : snapshots)
-        std::printf("  %s\n", s.c_str());
+    std::printf("Top of book through the day:\n     time          bid size @ bid        | ask        @ ask size\n");
+    for (const auto& snapshot : snapshots)
+        std::printf("  %s\n", snapshot.c_str());
 
     auto pct = [](std::uint64_t a, std::uint64_t b) { return b ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 100.0; };
 
@@ -363,16 +487,15 @@ ValidationResult Validate(const std::vector<itch::Event>& events, const Options&
 
     std::printf("\nChecks:\n");
     check(unknownReferences == 0, "every E/C/X/D/U references a live order", str("%" PRIu64 " unknown", unknownReferences));
-    check(crossedWhileTrading == 0, "book crossed only while halted/paused (or re-opening)",
-        str("%" PRIu64 " crossed messages, %" PRIu64 " not explained", crossedSamples, crossedWhileTrading));
-    check(topMismatches == 0, "baseline == fast top-of-book after every message",
-        topMismatches ? str("%" PRIu64 " mismatches, first at #%" PRIu64, topMismatches, firstMismatchIndex) : str("%zu messages", events.size()));
-    check(depthMismatches == 0, "baseline == fast full depth (sampled every 10k messages)",
-        str("%" PRIu64 "/%" PRIu64 " snapshots equal", depthComparisons - depthMismatches, depthComparisons));
-    check(fast.Size() == baseline.Size() && fast.Size() == shadow.size(), "resting order counts agree (fast/baseline/shadow)",
-        str("%zu / %zu / %zu", fast.Size(), baseline.Size(), shadow.size()));
     check(executionsAtTouch == executions, "every execution hit the order at our best bid/ask",
         str("%" PRIu64 "/%" PRIu64 " (%.4f%%)", executionsAtTouch, executions, pct(executionsAtTouch, executions)));
+    check(topMismatches == 0, "top of book == independent feed mirror, every message",
+        topMismatches ? str("%" PRIu64 " mismatches, first at #%" PRIu64, topMismatches, firstMismatchIndex) : str("%zu messages", events.size()));
+    check(depthMismatches == 0, "full depth == feed mirror (sampled every 10k messages)",
+        str("%" PRIu64 "/%" PRIu64 " snapshots equal", depthComparisons - depthMismatches, depthComparisons));
+    check(book.Size() == mirror.Size(), "resting order count == feed mirror", str("%zu / %zu", book.Size(), mirror.Size()));
+    check(crossedWhileTrading == 0, "book crossed only while halted/paused (or re-opening)",
+        str("%" PRIu64 " crossed messages, %" PRIu64 " not explained", crossedSamples, crossedWhileTrading));
     std::printf("  [info] executions at a price other than the order's (cross fills): %" PRIu64 "\n", executionsAwayFromOrderPrice);
     std::printf("  [info] peak resting orders: %zu; most price levels seen: %zu bid / %zu ask\n", peakLive, maxBidLevels, maxAskLevels);
     std::printf("  [info] hidden-order prints inside our spread:     %" PRIu64 "/%" PRIu64 " (%.2f%%)\n",
@@ -566,47 +689,23 @@ int RunSingleSymbol(const Options& options)
     std::printf("  TSC %.3f GHz; timer overhead p50 %.0f ns (included in the numbers below)\n",
         ticksPerNs, perf::Summarize(overhead, ticksPerNs).p50_);
 
-    std::unique_ptr<LatencyResult> fast, base;
-    if (options.engine_ != "baseline")
-    {
-        fast = std::make_unique<LatencyResult>(Measure<FastOrderbook>(bookEvents, options,
-            [&] { return std::make_unique<FastOrderbook>(capacity, options.tick_, options.band_); },
-            [](std::unique_ptr<FastOrderbook>& b) { b->Clear(); }));
-        PrintLatency("FastOrderbook (tick-ladder levels + pool + intrusive list + open-addressing map)", *fast, ticksPerNs, bookEvents.size());
-    }
-
-    if (options.engine_ != "fast")
-    {
-        base = std::make_unique<LatencyResult>(Measure<Orderbook>(bookEvents, options,
-            [] { return std::make_unique<Orderbook>(false); },
-            [](std::unique_ptr<Orderbook>& b) { b = std::make_unique<Orderbook>(false); }));
-        PrintLatency("Orderbook baseline (std::map levels + std::list + shared_ptr + mutex)", *base, ticksPerNs, bookEvents.size());
-    }
-
-    if (fast && base)
-    {
-        const auto f = perf::Summarize(fast->all_, ticksPerNs);
-        const auto b = perf::Summarize(base->all_, ticksPerNs);
-        std::printf("\n== Summary (%s, all book messages) ==\n", options.symbol_.c_str());
-        std::printf("  %-10s %8s %8s %8s %9s %14s\n", "engine", "p50", "p99", "p99.9", "max", "throughput");
-        std::printf("  %-10s %6.0fns %6.0fns %6.0fns %7.1fus %8.2f M/s\n", "baseline", b.p50_, b.p99_, b.p999_, b.max_ / 1000, base->throughput_ / 1e6);
-        std::printf("  %-10s %6.0fns %6.0fns %6.0fns %7.1fus %8.2f M/s\n", "fast", f.p50_, f.p99_, f.p999_, f.max_ / 1000, fast->throughput_ / 1e6);
-        std::printf("  speed-up   %7.1fx %7.1fx %7.1fx %8.1fx %9.1fx\n",
-            b.p50_ / f.p50_, b.p99_ / f.p99_, b.p999_ / f.p999_, b.max_ / f.max_, fast->throughput_ / base->throughput_);
-    }
+    const auto result = Measure<Orderbook>(bookEvents, options,
+        [&] { return std::make_unique<Orderbook>(capacity, options.tick_, options.band_); },
+        [](std::unique_ptr<Orderbook>& b) { b->Clear(); });
+    PrintLatency("Orderbook", result, ticksPerNs, bookEvents.size());
 
     return validation.passed_ ? 0 : 2;
 }
 
 //streams every symbol; events are decoded into a chunk, then the chunk is
-//applied to each engine with only the apply loop timed. After every chunk
-//(untimed) both engines are compared symbol by symbol, and any crossed book is
-//checked against the trading state NASDAQ reported for that symbol.
+//applied to the books with only the apply loop timed. After every chunk
+//(untimed) each symbol's book is compared with the feed mirror, and any
+//crossed book is checked against the trading state NASDAQ reported for it.
 class AllSymbols
 {
 public:
-    AllSymbols(bool baseline, std::uint32_t band, bool strict)
-        : baseline_{ baseline }, strict_{ strict }, band_{ band }, fast_(65536), base_(65536), state_(65536, '?'), stateSince_(65536, 0), names_(65536)
+    AllSymbols(std::uint32_t band, bool strict)
+        : strict_{ strict }, band_{ band }, books_(65536), state_(65536, '?'), stateSince_(65536, 0), names_(65536)
     {
         chunk_.reserve(ChunkSize);
     }
@@ -628,16 +727,14 @@ public:
         //books are created up front (untimed): a symbol's first price picks its tick grid
         for (const auto& e : chunk_)
         {
-            if (e.type_ == 'H' || fast_[e.locate_])
+            if (e.type_ == 'H' || books_[e.locate_])
                 continue;
             //Reg NMS: sub-penny prices are only allowed below $1.00, so a
             //penny grid suits anything that first trades above $1
-            fast_[e.locate_] = std::make_unique<FastOrderbook>(256, e.price_ >= 10'000 ? 100 : 1, band_);
-            if (baseline_)
-                base_[e.locate_] = std::make_unique<Orderbook>(false);
+            books_[e.locate_] = std::make_unique<Orderbook>(256, e.price_ >= 10'000 ? 100 : 1, band_);
         }
 
-        auto start = Clock::now();
+        const auto start = Clock::now();
         if (strict_)
         {
             //per-message check: a crossed book is only legal while NASDAQ has
@@ -649,7 +746,7 @@ public:
                     SetState(e);
                     continue;
                 }
-                auto& book = *fast_[e.locate_];
+                auto& book = *books_[e.locate_];
                 itch::Apply(book, e);
                 if (book.GetTopOfBook().IsCrossed())
                 {
@@ -668,18 +765,9 @@ public:
         {
             for (const auto& e : chunk_)
                 if (e.type_ != 'H')
-                    itch::Apply(*fast_[e.locate_], e);
+                    itch::Apply(*books_[e.locate_], e);
         }
-        fastTime_ += Clock::now() - start;
-
-        if (baseline_)
-        {
-            start = Clock::now();
-            for (const auto& e : chunk_)
-                if (e.type_ != 'H')
-                    itch::Apply(*base_[e.locate_], e);
-            baseTime_ += Clock::now() - start;
-        }
+        engineTime_ += Clock::now() - start;
 
         std::uint64_t now = 0;
         for (const auto& e : chunk_)
@@ -691,7 +779,10 @@ public:
                     SetState(e);
             }
             else
+            {
+                mirror_.Apply(e);
                 ++events_;
+            }
         }
         chunk_.clear();
         Checkpoint(now);
@@ -700,22 +791,15 @@ public:
     void Report(double parseSeconds) const
     {
         std::size_t books = 0;
-        for (const auto& b : fast_)
+        for (const auto& b : books_)
             books += b != nullptr;
 
-        auto rate = [this](Clock::duration t) { return static_cast<double>(events_) / 1e6 / Seconds(t); };
         std::printf("\n== Full-day replay, all symbols ==\n");
-        std::printf("  %" PRIu64 " book messages across %zu symbols (end-to-end incl. parse/I-O: %.1fs)\n", events_, books, parseSeconds);
-        std::printf("  fast:     %6.2fs engine time  -> %6.2f M msgs/sec%s\n", Seconds(fastTime_), rate(fastTime_),
-            strict_ ? "  (includes per-message checks)" : "");
-        if (baseline_)
-        {
-            std::printf("  baseline: %6.2fs engine time  -> %6.2f M msgs/sec\n", Seconds(baseTime_), rate(baseTime_));
-            if (!strict_)
-                std::printf("  speed-up: %.1fx\n", Seconds(baseTime_) / Seconds(fastTime_));
-            std::printf("  [%s] engines agree on every symbol's top of book and order count at all %" PRIu64 " checkpoints (%" PRIu64 " mismatches)\n",
-                mismatches_ == 0 ? "PASS" : "FAIL", checkpoints_, mismatches_);
-        }
+        std::printf("  %" PRIu64 " book messages across %zu symbols (end-to-end incl. parse/I-O and checks: %.1fs)\n", events_, books, parseSeconds);
+        std::printf("  engine time %.2fs -> %.2f M msgs/sec%s\n", Seconds(engineTime_),
+            static_cast<double>(events_) / 1e6 / Seconds(engineTime_), strict_ ? "  (includes per-message checks)" : "");
+        std::printf("  [%s] every symbol's top of book and order count == feed mirror at all %" PRIu64 " checkpoints (%" PRIu64 " mismatches)\n",
+            mismatches_ == 0 ? "PASS" : "FAIL", checkpoints_, mismatches_);
         std::printf("  [%s] every book crossed at a checkpoint was halted/paused/re-opening (%" PRIu64 " crossed, %" PRIu64 " unexplained)\n",
             checkpointCrossedWhileTrading_ == 0 ? "PASS" : "FAIL", checkpointCrossed_, checkpointCrossedWhileTrading_);
         if (strict_)
@@ -723,8 +807,8 @@ public:
             std::printf("  [%s] per message: book crossed only while halted/paused/re-opening (%" PRIu64 " crossed messages, %" PRIu64 " unexplained)\n",
                 crossedWhileTrading_ == 0 ? "PASS" : "FAIL", crossedMessages_, crossedWhileTrading_);
             std::printf("  symbols whose book was ever crossed:");
-            for (const auto& s : crossedSymbols_)
-                std::printf(" %s", s.c_str());
+            for (const auto& symbol : crossedSymbols_)
+                std::printf(" %s", symbol.c_str());
             std::printf("\n");
         }
     }
@@ -754,12 +838,13 @@ private:
     void Checkpoint(std::uint64_t now)
     {
         ++checkpoints_;
-        for (std::size_t i = 0; i < fast_.size(); ++i)
+        for (std::size_t i = 0; i < books_.size(); ++i)
         {
-            if (!fast_[i])
+            if (!books_[i])
                 continue;
-            const auto top = fast_[i]->GetTopOfBook();
-            if (baseline_ && (top != base_[i]->GetTopOfBook() || fast_[i]->Size() != base_[i]->Size()))
+            const auto locate = static_cast<std::uint16_t>(i);
+            const auto top = books_[i]->GetTopOfBook();
+            if (top != mirror_.Top(locate) || books_[i]->Size() != mirror_.Size(locate))
                 ++mismatches_;
             if (top.IsCrossed())
             {
@@ -769,16 +854,15 @@ private:
         }
     }
 
-    bool baseline_;
     bool strict_;
     std::uint32_t band_;
     std::vector<itch::Event> chunk_;
-    std::vector<std::unique_ptr<FastOrderbook>> fast_;
-    std::vector<std::unique_ptr<Orderbook>> base_;
+    std::vector<std::unique_ptr<Orderbook>> books_;
+    FeedMirror mirror_;
     std::vector<char> state_;
     std::vector<std::uint64_t> stateSince_;
     std::vector<std::string> names_;
-    Clock::duration fastTime_{ }, baseTime_{ };
+    Clock::duration engineTime_{ };
     std::uint64_t events_{ };
     std::uint64_t checkpoints_{ }, mismatches_{ }, checkpointCrossed_{ }, checkpointCrossedWhileTrading_{ };
     std::uint64_t crossedMessages_{ }, crossedWhileTrading_{ };
@@ -791,7 +875,7 @@ int RunAllSymbols(const Options& options)
         perf::PinCurrentThread(options.pin_);
 
     std::printf("Replaying every symbol in %s ...\n", options.path_.c_str());
-    auto replay = std::make_unique<AllSymbols>(options.engine_ != "fast", options.band_, options.strict_);
+    auto replay = std::make_unique<AllSymbols>(options.band_, options.strict_);
     std::FILE* file = Open(options.path_);
     const auto start = Clock::now();
     const auto stats = itch::ParseFile(file, *replay);
@@ -830,8 +914,6 @@ int main(int argc, char** argv)
         else if (arg == "--runs") options.runs_ = std::max(1, std::stoi(next()));
         else if (arg == "--expect-open") options.expectOpen_ = std::stod(next());
         else if (arg == "--expect-close") options.expectClose_ = std::stod(next());
-        else if (arg == "--engine") options.engine_ = next();
-        else if (arg == "--skip-baseline") options.engine_ = "fast";
         else if (arg == "--no-validate") options.validate_ = false;
         else if (arg == "--strict") options.strict_ = true;
         else if (arg == "--tick") options.tick_ = std::stoi(next());
@@ -848,7 +930,7 @@ int main(int argc, char** argv)
     {
         std::fprintf(stderr,
             "usage: replay <itch-file|-> [--symbol AAPL] [--all] [--pin CPU] [--warmup N] [--runs N]\n"
-            "              [--expect-open PRICE] [--expect-close PRICE] [--engine fast|baseline|both] [--no-validate]\n"
+            "              [--expect-open PRICE] [--expect-close PRICE] [--no-validate]\n"
             "              [--tick PRICE_UNITS] [--band TICKS] [--strict]\n");
         return 1;
     }

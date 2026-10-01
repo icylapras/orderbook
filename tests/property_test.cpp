@@ -235,7 +235,7 @@ void Fuzz(std::uint32_t seed, Profile profile)
 template <typename Engine>
 class PropertyTest : public ::testing::Test { };
 
-using Engines = ::testing::Types<BaselineEngine, FastEngine, FastSortedEngine, FastMixedEngine>;
+using Engines = ::testing::Types<LadderEngine, SortedEngine, MixedEngine>;
 TYPED_TEST_SUITE(PropertyTest, Engines);
 
 //tight band: nearly every order interacts with the other side
@@ -263,13 +263,13 @@ TYPED_TEST(PropertyTest, MatchesReferenceWithPassiveInsertsAndCrossedBooks)
         ASSERT_NO_FATAL_FAILURE(Fuzz<TypeParam>(seed, Profile{ 1, 400, 100, 3'000, true }));
 }
 
-//the two engines against each other on a much longer stream (the reference
-//model is too slow for this); grows the id map and pool through many rehashes
-TEST(DifferentialTest, FastMatchesBaselineOnLongStream)
+//the layouts against each other on a much longer stream (the reference model
+//is too slow for this); grows the id map and pools through many rehashes
+TEST(DifferentialTest, LayoutsAgreeOnLongStream)
 {
     std::mt19937 rng{ 7 };
-    BaselineEngine baseline;
-    FastEngine fast;
+    SortedEngine sorted;
+    LadderEngine ladder;
     std::vector<OrderId> live;
     OrderId nextId = 1;
     std::uniform_int_distribution<Price> price{ 900, 1100 };
@@ -285,8 +285,8 @@ TEST(DifferentialTest, FastMatchesBaselineOnLongStream)
             const auto side = percent(rng) < 50 ? Side::Buy : Side::Sell;
             const auto p = price(rng);
             const auto q = quantity(rng);
-            const auto a = baseline.Add(type, nextId, side, p, q);
-            const auto b = fast.Add(type, nextId, side, p, q);
+            const auto a = sorted.Add(type, nextId, side, p, q);
+            const auto b = ladder.Add(type, nextId, side, p, q);
             ASSERT_NO_FATAL_FAILURE(ExpectSameTrades(b, a, "step " + std::to_string(step)));
             live.push_back(nextId++);
         }
@@ -296,25 +296,25 @@ TEST(DifferentialTest, FastMatchesBaselineOnLongStream)
             const auto id = live[index];
             if (roll < 85)
             {
-                baseline.Cancel(id);
-                fast.Cancel(id);
+                sorted.Cancel(id);
+                ladder.Cancel(id);
                 live[index] = live.back();
                 live.pop_back();
             }
             else
             {
                 const auto q = quantity(rng);
-                baseline.Reduce(id, q);
-                fast.Reduce(id, q);
+                sorted.Reduce(id, q);
+                ladder.Reduce(id, q);
             }
         }
 
-        ASSERT_EQ(fast.Top(), baseline.Top()) << "step " << step;
-        ASSERT_EQ(fast.Size(), baseline.Size()) << "step " << step;
+        ASSERT_EQ(ladder.Top(), sorted.Top()) << "step " << step;
+        ASSERT_EQ(ladder.Size(), sorted.Size()) << "step " << step;
     }
 
-    const auto a = baseline.Levels();
-    const auto b = fast.Levels();
+    const auto a = sorted.Levels();
+    const auto b = ladder.Levels();
     ExpectSameLevels(b.GetBids(), a.GetBids(), "final bids");
     ExpectSameLevels(b.GetAsks(), a.GetAsks(), "final asks");
 }

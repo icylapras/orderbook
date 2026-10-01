@@ -1,10 +1,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <iostream>
-#include <memory>
 #include <string>
 
-#include "Order.h"
 #include "OrderType.h"
 #include "Orderbook.h"
 #include "Side.h"
@@ -80,8 +78,7 @@ int main()
 
     auto AddLimit = [&](Side side, Price price, Quantity quantity)
     {
-        return orderbook.AddOrder(std::make_shared<Order>(
-            OrderType::GoodTillCancel, nextId++, side, price, quantity));
+        return orderbook.AddOrder(OrderType::GoodTillCancel, nextId++, side, price, quantity);
     };
 
     Heading("Seeded book");
@@ -94,14 +91,12 @@ int main()
     PrintBook(orderbook);
 
     Heading("Market buy 50 sweeps the ask side");
-    const auto marketTrades = orderbook.AddOrder(
-        std::make_shared<Order>(nextId++, Side::Buy, 50));
+    const auto marketTrades = orderbook.AddMarketOrder(nextId++, Side::Buy, 50);
     PrintTrades(marketTrades);
     PrintBook(orderbook);
 
     Heading("FillOrKill buy 200 @ 105 (more than the book holds)");
-    const auto killedTrades = orderbook.AddOrder(std::make_shared<Order>(
-        OrderType::FillOrKill, nextId++, Side::Buy, 105, 200));
+    const auto killedTrades = orderbook.AddOrder(OrderType::FillOrKill, nextId++, Side::Buy, 105, 200);
     PrintTrades(killedTrades);
     std::cout << "  rejected, book untouched: " << orderbook.Size() << " resting orders\n";
 

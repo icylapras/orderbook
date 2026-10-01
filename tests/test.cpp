@@ -217,7 +217,6 @@ public:
     const static inline std::filesystem::path TestFolderPath{ ORDERBOOK_TEST_FILES };
 };
 
-//every scenario runs against both engines
 template <typename Engine>
 void RunScenario(const std::filesystem::path& file)
 {
@@ -263,16 +262,12 @@ void RunScenario(const std::filesystem::path& file)
     ASSERT_EQ(orderbookInfos.GetAsks().size(), result.askCount_) << Engine::Name;
 }
 
-TEST_P(OrderbookTestsFixture, Baseline)
+//every scenario runs against all three price-level layouts
+TEST_P(OrderbookTestsFixture, Scenario)
 {
-    RunScenario<BaselineEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
-}
-
-TEST_P(OrderbookTestsFixture, Fast)
-{
-    RunScenario<FastEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
-    RunScenario<FastSortedEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
-    RunScenario<FastMixedEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
+    RunScenario<LadderEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
+    RunScenario<SortedEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
+    RunScenario<MixedEngine>(OrderbookTestsFixture::TestFolderPath / GetParam());
 }
 
 INSTANTIATE_TEST_SUITE_P(Tests, OrderbookTestsFixture, googletest::ValuesIn({

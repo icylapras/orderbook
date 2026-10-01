@@ -1,12 +1,10 @@
 #pragma once
 
-#include "Order.h"
 #include "Side.h"
 #include "Usings.h"
-#include "OrderType.h"
 
-
-//modify (cancel-replace) an order
+//modify (cancel-replace) an order: new side, price and quantity; the order
+//keeps its id and type but loses its place in the queue
 class OrderModify
 {
 public:
@@ -21,11 +19,6 @@ public:
     Price GetPrice() const { return price_; }
     Side GetSide() const { return side_; }
     Quantity GetQuantity() const { return quantity_; }
-
-    OrderPointer ToOrderPointer(OrderType type) const
-    {
-        return std::make_shared<Order>(type, GetOrderId(), GetSide(), GetPrice(), GetQuantity());
-    }
 
 private:
     OrderId orderId_;
