@@ -232,25 +232,18 @@ TEST(ItchParser, FlagsTruncatedFinalMessage)
     EXPECT_TRUE(r.deletes_.empty());
 }
 
-//a tiny hand-written session, replayed through both engines
+//a tiny hand-written session, replayed through the book
 template <typename Engine>
 class ItchReplay : public ::testing::Test { };
 
-using Engines = ::testing::Types<BaselineEngine, FastEngine, FastMixedEngine>;
+using Engines = ::testing::Types<LadderEngine, MixedEngine>;
 TYPED_TEST_SUITE(ItchReplay, Engines);
 
 namespace
 {
 
-TopOfBook ReplayInto(BaselineEngine& e, const std::vector<itch::Event>& events)
-{
-    for (const auto& ev : events)
-        itch::Apply(e.book_, ev);
-    return e.Top();
-}
-
 template <Price Tick, std::uint32_t Band>
-TopOfBook ReplayInto(FastEngineT<Tick, Band>& e, const std::vector<itch::Event>& events)
+TopOfBook ReplayInto(EngineT<Tick, Band>& e, const std::vector<itch::Event>& events)
 {
     for (const auto& ev : events)
         itch::Apply(e.book_, ev);

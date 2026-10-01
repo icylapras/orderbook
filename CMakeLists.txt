@@ -26,15 +26,14 @@ if(ORDERBOOK_SANITIZE)
     add_link_options(-fsanitize=${ORDERBOOK_SANITIZE})
 endif()
 
-# ---------------------------------------------------------------- engine
+#  engine
 add_library(orderbook_core
-    src/Orderbook.cpp
-    src/FastOrderbook.cpp)
+    src/Orderbook.cpp)
 target_include_directories(orderbook_core PUBLIC src)
 find_package(Threads REQUIRED)
 target_link_libraries(orderbook_core PUBLIC Threads::Threads)
 
-# ---------------------------------------------------------------- tools
+# tools
 add_executable(demo tools/demo.cpp)
 target_link_libraries(demo PRIVATE orderbook_core)
 
@@ -52,14 +51,14 @@ target_link_libraries(itchgen PRIVATE orderbook_core)
 add_executable(itchfilter tools/itchfilter.cpp)
 target_link_libraries(itchfilter PRIVATE orderbook_core)
 
-# ---------------------------------------------------------------- benchmarks
+# benchmarks
 add_executable(bench_engine bench/benchmark.cpp)
 target_link_libraries(bench_engine PRIVATE orderbook_core)
 
 add_executable(bench_queue bench/queue_bench.cpp)
 target_link_libraries(bench_queue PRIVATE orderbook_core)
 
-# ---------------------------------------------------------------- tests
+# tests
 enable_testing()
 
 if(NOT ORDERBOOK_FETCH_GTEST AND NOT ORDERBOOK_SANITIZE)
@@ -82,15 +81,14 @@ add_executable(unit_tests
     tests/test.cpp
     tests/property_test.cpp
     tests/itch_test.cpp
-    tests/components_test.cpp
-    tests/concurrency_test.cpp)
+    tests/components_test.cpp)
 target_link_libraries(unit_tests PRIVATE orderbook_core GTest::gtest_main)
 target_compile_definitions(unit_tests PRIVATE ORDERBOOK_TEST_FILES="${CMAKE_CURRENT_SOURCE_DIR}/tests/TestFiles")
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests DISCOVERY_TIMEOUT 60)
 
-# ---------------------------------------------------------------- fuzzing
+# fuzzing
 if(ORDERBOOK_FUZZ)
     add_executable(fuzz_itch fuzz/itch_fuzz.cpp)
     target_link_libraries(fuzz_itch PRIVATE orderbook_core)

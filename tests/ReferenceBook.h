@@ -2,7 +2,7 @@
 
 //the matching rules written as plainly as possible: a flat vector of orders,
 //every query a linear scan. Too slow for real use, but short enough to check
-//by reading, which is the point: both engines are fuzzed against it.
+//by reading, which is the point: every price-level layout is fuzzed against it.
 
 #include <algorithm>
 #include <cstdint>

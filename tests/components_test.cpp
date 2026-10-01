@@ -1,5 +1,5 @@
 //tests for the building blocks: id map, latency histogram, SPSC queue,
-//and FastOrderbook-specific behaviour
+//and Orderbook-specific behaviour
 
 #include <gtest/gtest.h>
 
@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "FastOrderbook.h"
+#include "Orderbook.h"
 #include "OrderIdMap.h"
 #include "PriceLadder.h"
 #include "SpscQueue.h"
@@ -281,9 +281,9 @@ void TransferInOrder()
 TEST(SpscQueue, TransfersInOrderAcrossThreads) { TransferInOrder<SpscQueue<std::uint64_t>>(); }
 TEST(MutexQueue, TransfersInOrderAcrossThreads) { TransferInOrder<MutexQueue<std::uint64_t>>(); }
 
-TEST(FastOrderbook, CancelGoodForDayOrdersOnlyRemovesThem)
+TEST(Orderbook, CancelGoodForDayOrdersOnlyRemovesThem)
 {
-    FastOrderbook book;
+    Orderbook book;
     book.AddOrder(OrderType::GoodForDay, 1, Side::Buy, 100, 10);
     book.AddOrder(OrderType::GoodTillCancel, 2, Side::Buy, 100, 10);
     book.AddOrder(OrderType::GoodForDay, 3, Side::Sell, 105, 10);
@@ -298,9 +298,9 @@ TEST(FastOrderbook, CancelGoodForDayOrdersOnlyRemovesThem)
     EXPECT_EQ(top.askPrice_, 106);
 }
 
-TEST(FastOrderbook, ClearKeepsWorking)
+TEST(Orderbook, ClearKeepsWorking)
 {
-    FastOrderbook book{ 4 };
+    Orderbook book{ 4 };
     for (int round = 0; round < 3; ++round)
     {
         for (OrderId id = 1; id <= 100; ++id)
@@ -313,9 +313,9 @@ TEST(FastOrderbook, ClearKeepsWorking)
     }
 }
 
-TEST(FastOrderbook, TimePriorityWithinLevel)
+TEST(Orderbook, TimePriorityWithinLevel)
 {
-    FastOrderbook book;
+    Orderbook book;
     book.AddOrder(OrderType::GoodTillCancel, 1, Side::Sell, 100, 5);
     book.AddOrder(OrderType::GoodTillCancel, 2, Side::Sell, 100, 5);
     book.AddOrder(OrderType::GoodTillCancel, 3, Side::Sell, 100, 5);
@@ -330,9 +330,9 @@ TEST(FastOrderbook, TimePriorityWithinLevel)
     EXPECT_EQ(book.GetTopOfBook().askQuantity_, 2u);
 }
 
-TEST(FastOrderbook, ReduceKeepsQueuePosition)
+TEST(Orderbook, ReduceKeepsQueuePosition)
 {
-    FastOrderbook book;
+    Orderbook book;
     book.AddOrder(OrderType::GoodTillCancel, 1, Side::Buy, 100, 10);
     book.AddOrder(OrderType::GoodTillCancel, 2, Side::Buy, 100, 10);
     book.ReduceOrder(1, 7);//still first in line, now 3 shares

@@ -20,7 +20,7 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
       - name: Build
         run: cmake --build build
-      - name: Unit, property and concurrency tests
+      - name: Unit, property and ITCH tests
         run: ctest --test-dir build --output-on-failure
       - name: Replay a synthetic ITCH day with full validation
         run: |
@@ -67,14 +67,14 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DORDERBOOK_SANITIZE=thread
       - name: Build
         run: cmake --build build
-      # the expiry thread, concurrent callers and both queues across real threads
+      # includes both queues moving data across real threads
       - name: Tests
         run: ctest --test-dir build --output-on-failure
       - name: SPSC vs mutex queue across threads
         run: ./build/bench_queue --producer-cpu 0 --consumer-cpu 1
 
   fuzz:
-    name: libFuzzer (ITCH parser -> both engines)
+    name: libFuzzer (ITCH parser -> order book)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
