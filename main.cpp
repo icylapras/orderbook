@@ -3,7 +3,5 @@
 int main()
 {
     Orderbook orderbook;
-
-
-    return 0;
+    return static_cast<int>(orderbook.Size());
 }
